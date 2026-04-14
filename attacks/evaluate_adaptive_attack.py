@@ -47,7 +47,7 @@ def pca_multi_direction_attack(
     benign_prompts: List[str],
     refusal_toks,
     top_k: int = 8,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> Dict:
     """
     Extract the top-*k* principal components of the harmful-vs-benign
@@ -147,7 +147,7 @@ def per_layer_adaptive_attack(
     harmful_prompts: List[str],
     benign_prompts: List[str],
     refusal_toks,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> Dict:
     """
     Instead of using a single global direction, extract and ablate a
@@ -218,7 +218,7 @@ def sublayer_probing_attack(
     harmful_prompts: List[str],
     benign_prompts: List[str],
     original_direction: torch.Tensor,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> Dict:
     """
     Probe *inside* sublayer boundaries (attention Q/K/V inputs, MLP gate/up
@@ -316,7 +316,7 @@ def run_all_adaptive_attacks(
     original_direction: torch.Tensor,
     refusal_toks,
     pca_top_k: int = 8,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> Dict:
     results = {}
 
