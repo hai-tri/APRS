@@ -26,3 +26,7 @@ lm_eval_*/
 
 # Environment
 .env
+
+# Private files
+results.csv
+nips_paper_idea.md

@@ -1,7 +1,0 @@
-model,projection_mode,num_layers,per_layer_direction,epsilon,calibration_prompts,pertinent_layers,z_sum_norm,max_cos_sim,pca8_score_undefended,pca8_score_defended,perlayer_score_undefended,perlayer_score_defended,arditi_score_undefended,arditi_score_defended,leace_score_undefended,leace_score_defended,kl_harmful,kl_harmless,harmbench_asr,xstest_over_refusal_rate,gsm8k_exact_match,math500_exact_match,mmlu_acc,llamaguard_asr,softopt_asr
-Meta-Llama-3-8B-Instruct,undefended,—,—,—,—,—,—,1.000,0.612,0.612,0.412,0.412,5.691,5.691,—,0.000,—,—
-Meta-Llama-3-8B-Instruct,scalar_projection,5,False,0.3,32,"[9,10,11,12,13]",—,0.780,0.612,1.200,0.412,1.320,5.691,—,0.000,0.000,0.002,0.03
-Meta-Llama-3-8B-Instruct,scalar_projection,5,True,0.3,32,"[9,10,11,12,13]",1.233,0.750,0.612,0.307,0.412,0.269,5.691,5.745,0.000014,0.008756,0.03
-meta-llama/Meta-Llama-3-8B-Instruct,hadamard,5,True,0.1,32,"[9, 10, 11, 12, 13]",0.5805,0.7502,0.6122,0.4303,0.4119,0.2042,5.6907,5.4439,0.000002,0.001333,,,
-meta-llama/Meta-Llama-3-8B-Instruct,full,5,True,0.1,32,"[9, 10, 11, 12, 13]",20.7644,0.5871,0.6122,2.3488,0.4119,4.1115,5.6907,1.4525,0.022182,6.996597,,,
-meta-llama/Meta-Llama-3-8B-Instruct,full,5,True,0.2,128,"[9, 10, 11, 12, 13]",40.9253,0.3843,0.6122,1.9368,0.4119,5.9133,5.6907,5.6266,,,0.001402,12.722070,,,
