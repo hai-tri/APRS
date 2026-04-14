@@ -106,7 +106,7 @@ run_config() {
     fi
 
     set +e
-    python3 "$REPO_DIR/run_obfuscation_pipeline.py" \
+    python3 -u "$REPO_DIR/run_obfuscation_pipeline.py" \
         --model_path "$MODEL_ID" \
         --save_csv   "$csv_path" \
         "${cache_args[@]}" \
