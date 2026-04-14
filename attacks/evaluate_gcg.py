@@ -113,7 +113,7 @@ def _token_gradients(
     with torch.no_grad():
         prefix_embeds = embed(input_ids[:, :suffix_start])
         target_embeds = embed(input_ids[:, suffix_end:])
-    suffix_embeds = (one_hot @ embed.weight).unsqueeze(0)  # (1, sfx, d)
+    suffix_embeds = (one_hot.to(embed.weight.dtype) @ embed.weight).unsqueeze(0)  # (1, sfx, d)
 
     inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=1)
 
