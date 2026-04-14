@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_sweep.sh — Hyperparameter sweep for the APRS obfuscation defense
+# run_sweep.sh — Per-mode hyperparameter sweep for the APRS obfuscation defense
 #
 # Usage:
 #   bash run_sweep.sh [--model MODEL_ID] [--output_dir DIR] [--attacks]
@@ -10,15 +10,28 @@
 #   --output_dir Base directory for per-run CSVs & logs (default: $HOME/aprs_sweep)
 #   --attacks    If set, also runs GCG/AutoDAN/CipherChat/PAIR/ReNeLLM per run
 #
-# Sweep design:
-#   Sweep 0  — undefended baseline (--undefended_only)
-#   Sweep 1  — projection_mode ∈ {scalar_projection, hadamard, full}      (ε=0.1)
-#   Sweep 2a — epsilon ∈ {0.3,0.2,0.15,0.05,0.025,0.01}  scalar_projection
-#   Sweep 2b — epsilon ∈ {0.3,0.2,0.15,0.05,0.025,0.01}  hadamard
-#   Sweep 2c — epsilon ∈ {0.3,0.2,0.15,0.05,0.025,0.01}  full
-#   Sweep 3  — n_calibration ∈ {32,64,256,512}             (ε=0.1, scalar)
-#   Sweep 4  — per_layer_direction on/off                  (ε=0.1, scalar)
-#   Sweep 5  — baselines: surgical / cast / circuit_breakers
+# Sweep design (40 runs) — each projection mode is tuned independently:
+#
+#   Sweep 0   — undefended baseline
+#
+#   Sweep 1   — epsilon × mode  (7 ε values × 3 modes = 21 runs)
+#               ε ∈ {0.3, 0.2, 0.15, 0.1, 0.05, 0.025, 0.01}
+#               mode ∈ {scalar_projection, hadamard, full}
+#               Fixed: n_cal=128, per_layer=True
+#
+#   Sweep 2   — n_calibration × mode  (4 n_cal values × 3 modes = 12 runs)
+#               n_cal ∈ {32, 64, 256, 512}  (128 covered by Sweep 1)
+#               Fixed: best ε per mode (approximated as 0.1 anchor), per_layer=True
+#
+#   Sweep 3   — per_layer vs global × mode  (1 × 3 = 3 runs)
+#               Fixed: ε=0.1, n_cal=128  (per_layer covered by Sweep 1)
+#
+#   Sweep 4   — baseline defenses  (3 runs)
+#               defense_type ∈ {surgical, cast, circuit_breakers}
+#
+# NOTE: Attacks (GCG/AutoDAN/CipherChat/PAIR/ReNeLLM) should be run separately
+# on the best config per mode after inspecting all_results.csv — use --attacks
+# only for targeted final-table runs to avoid 40× attack overhead.
 # =============================================================================
 
 set -euo pipefail
@@ -61,6 +74,10 @@ if [[ $RUN_ATTACKS -eq 1 ]]; then
     )
 fi
 
+# Direction extraction is keyed only by model alias inside refusal_direction,
+# so after the first successful run we can safely reuse the cached direction.
+_DIRECTION_READY=0
+
 # ── Helper: run one pipeline configuration ───────────────────────────────────
 # run_config <tag> [pipeline_args...]
 run_config() {
@@ -74,10 +91,16 @@ run_config() {
     echo "── $tag" | tee -a "$MASTER_LOG"
     echo "   args : ${extra_args[*]}" | tee -a "$MASTER_LOG"
 
+    local cache_args=()
+    if [[ $_DIRECTION_READY -eq 1 ]]; then
+        cache_args=(--skip_direction_extraction)
+    fi
+
     set +e
     python3 "$REPO_DIR/run_obfuscation_pipeline.py" \
         --model_path "$MODEL_ID" \
         --save_csv   "$csv_path" \
+        "${cache_args[@]}" \
         "${extra_args[@]}" \
         "${_ATTACK_FLAGS[@]}" \
         2>&1 | tee "$log_path"
@@ -85,6 +108,7 @@ run_config() {
     set -e
 
     if [[ $rc -eq 0 ]]; then
+        _DIRECTION_READY=1
         echo "   [OK] → $csv_path" | tee -a "$MASTER_LOG"
     else
         echo "   [WARN] exited $rc — see $log_path" | tee -a "$MASTER_LOG"
@@ -98,24 +122,12 @@ run_config "sweep0_undefended" \
     --undefended_only
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Sweep 1 — Projection mode  (ε=0.1, n_cal=128, per_layer)
+# Sweep 1 — Epsilon × projection mode  (7 × 3 = 21 runs)
 # ═══════════════════════════════════════════════════════════════════════════
 for mode in scalar_projection hadamard full; do
-    run_config "sweep1_mode_${mode}" \
-        --projection_mode "$mode" \
-        --epsilon 0.1 \
-        --num_calibration_prompts 128 \
-        --per_layer_direction
-done
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Sweep 2 — Epsilon × projection mode
-# (ε=0.1 already covered by Sweep 1, skip it here)
-# ═══════════════════════════════════════════════════════════════════════════
-for mode in scalar_projection hadamard full; do
-    for eps in 0.3 0.2 0.15 0.05 0.025 0.01; do
+    for eps in 0.3 0.2 0.15 0.1 0.05 0.025 0.01; do
         eps_tag="${eps//./_}"
-        run_config "sweep2_${mode}_eps${eps_tag}" \
+        run_config "sweep1_${mode}_eps${eps_tag}" \
             --projection_mode "$mode" \
             --epsilon "$eps" \
             --num_calibration_prompts 128 \
@@ -124,36 +136,40 @@ for mode in scalar_projection hadamard full; do
 done
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Sweep 3 — Calibration set size  (scalar, ε=0.1, per_layer)
-# (n_cal=128 already covered by Sweep 1)
+# Sweep 2 — Calibration set size × projection mode  (4 × 3 = 12 runs)
+# n_cal=128 already covered by Sweep 1; use ε=0.1 as anchor
 # ═══════════════════════════════════════════════════════════════════════════
-for ncal in 32 64 256 512; do
-    run_config "sweep3_ncal${ncal}" \
-        --projection_mode scalar_projection \
-        --epsilon 0.1 \
-        --num_calibration_prompts "$ncal" \
-        --per_layer_direction
+for mode in scalar_projection hadamard full; do
+    for ncal in 32 64 256 512; do
+        run_config "sweep2_${mode}_ncal${ncal}" \
+            --projection_mode "$mode" \
+            --epsilon 0.1 \
+            --num_calibration_prompts "$ncal" \
+            --per_layer_direction
+    done
 done
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Sweep 4 — Per-layer vs global direction  (scalar, ε=0.1, n_cal=128)
-# (per_layer already covered by Sweep 1)
+# Sweep 3 — Per-layer vs global direction × projection mode  (1 × 3 = 3 runs)
+# per_layer=True already covered by Sweep 1; ε=0.1, n_cal=128 as anchor
 # ═══════════════════════════════════════════════════════════════════════════
-run_config "sweep4_global_direction" \
-    --projection_mode scalar_projection \
-    --epsilon 0.1 \
-    --num_calibration_prompts 128
+for mode in scalar_projection hadamard full; do
+    run_config "sweep3_${mode}_global" \
+        --projection_mode "$mode" \
+        --epsilon 0.1 \
+        --num_calibration_prompts 128
+done
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Sweep 5 — Baseline defenses
+# Sweep 4 — Baseline defenses  (3 runs)
 # ═══════════════════════════════════════════════════════════════════════════
-run_config "sweep5_surgical" \
+run_config "sweep4_surgical" \
     --defense_type surgical
 
-run_config "sweep5_cast" \
+run_config "sweep4_cast" \
     --defense_type cast
 
-run_config "sweep5_circuit_breakers" \
+run_config "sweep4_circuit_breakers" \
     --defense_type circuit_breakers
 
 # ═══════════════════════════════════════════════════════════════════════════
