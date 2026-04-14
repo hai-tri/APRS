@@ -57,6 +57,8 @@ from attacks.evaluate_leace_attack import leace_attack
 from attacks.evaluate_gcg import evaluate_gcg
 from attacks.evaluate_autodan import evaluate_autodan
 from attacks.evaluate_cipherchat import evaluate_cipherchat
+from attacks.evaluate_pair import evaluate_pair
+from attacks.evaluate_renellm import evaluate_renellm
 from evaluations.evaluate_harmbench import evaluate_harmbench_asr
 from benchmarks.evaluate_xstest import evaluate_xstest
 from benchmarks.evaluate_lm_harness import run_lm_harness
@@ -163,6 +165,25 @@ def parse_arguments():
     parser.add_argument("--cipherchat_ciphers", type=str, default="caesar,base64",
                         help="Comma-separated cipher types to try: "
                              "caesar,morse,ascii,base64 (default: caesar,base64)")
+    # PAIR
+    parser.add_argument("--pair", action="store_true",
+                        help="Run PAIR black-box attack (Chao et al. 2023)")
+    parser.add_argument("--pair_streams", type=int, default=5,
+                        help="PAIR parallel streams per behavior (default: 5)")
+    parser.add_argument("--pair_iterations", type=int, default=5,
+                        help="PAIR refinement iterations per stream (default: 5)")
+    parser.add_argument("--pair_n_behaviors", type=int, default=25,
+                        help="Number of behaviors to attack with PAIR (default: 25)")
+    parser.add_argument("--pair_attacker", type=str, default=None,
+                        help="HF path for a separate attacker LLM; "
+                             "defaults to self-PAIR (uses target model)")
+    # ReNeLLM
+    parser.add_argument("--renellm", action="store_true",
+                        help="Run ReNeLLM nested jailbreak attack (Ding et al. 2023)")
+    parser.add_argument("--renellm_strategies", type=int, default=2,
+                        help="Number of rewriting strategies to chain (default: 2)")
+    parser.add_argument("--renellm_attempts", type=int, default=3,
+                        help="Scenario attempts per behavior (default: 3)")
     parser.add_argument("--save_csv", type=str, default=None,
                         help="Path to CSV file to append results to (e.g. results.csv)")
     return parser.parse_args()
@@ -756,7 +777,49 @@ def run_pipeline(args):
         )
 
     # ==================================================================
-    # Stage 7f: SoftOpt white-box attack
+    # Stage 7f: PAIR black-box attack (Chao et al. 2023)
+    # ==================================================================
+    pair_result = None
+    if args.pair:
+        print("=" * 60)
+        print("Stage 7f: Running PAIR attack (Chao et al. 2023) …")
+        print("=" * 60)
+
+        pair_result = evaluate_pair(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_val,
+            refusal_toks=model_base.refusal_toks,
+            n_streams=args.pair_streams,
+            n_iterations=args.pair_iterations,
+            n_behaviors=args.pair_n_behaviors,
+            attacker_model_path=args.pair_attacker,
+            seed=args.seed,
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 7g: ReNeLLM nested jailbreak attack (Ding et al. 2023)
+    # ==================================================================
+    renellm_result = None
+    if args.renellm:
+        print("=" * 60)
+        print("Stage 7g: Running ReNeLLM attack (Ding et al. 2023) …")
+        print("=" * 60)
+
+        renellm_result = evaluate_renellm(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            harmful_prompts=harmful_val,
+            n_rewrite_strategies=args.renellm_strategies,
+            n_scenario_attempts=args.renellm_attempts,
+            seed=args.seed,
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 7h: SoftOpt white-box attack
     # ==================================================================
     softopt_result = None
     if args.softopt:
@@ -896,6 +959,16 @@ def run_pipeline(args):
         print(f"  Best ASR           : {cipherchat_result['best_asr']:.4f} "
               f"({cipherchat_result['best_cipher']})")
 
+    if pair_result:
+        print(f"  --- PAIR attack (Chao et al.) ---")
+        print(f"  Post-attack refusal: {pair_result['post_attack_refusal_score']:.4f}")
+        print(f"  ASR (score=10)     : {pair_result['asr']:.4f}")
+
+    if renellm_result:
+        print(f"  --- ReNeLLM attack (Ding et al.) ---")
+        print(f"  ASR                : {renellm_result['asr']:.4f} "
+              f"({renellm_result['n_jailbroken']}/{renellm_result['n_total']})")
+
     if softopt_result:
         print(f"  --- SoftOpt attack ---")
         print(f"  ASR (HarmBench)    : {softopt_result['softopt_asr']:.4f} "
@@ -961,6 +1034,9 @@ def run_pipeline(args):
             "autodan_asr",
             "cipherchat_best_asr",
             "cipherchat_best_cipher",
+            "pair_score",
+            "pair_asr",
+            "renellm_asr",
         ]
 
         row = {
@@ -996,6 +1072,9 @@ def run_pipeline(args):
             "autodan_asr": "",
             "cipherchat_best_asr": "",
             "cipherchat_best_cipher": "",
+            "pair_score": "",
+            "pair_asr": "",
+            "renellm_asr": "",
         }
 
         if undefended_leace:
@@ -1033,6 +1112,11 @@ def run_pipeline(args):
         if cipherchat_result:
             row["cipherchat_best_asr"]    = f"{cipherchat_result['best_asr']:.4f}"
             row["cipherchat_best_cipher"] = cipherchat_result["best_cipher"] or ""
+        if pair_result:
+            row["pair_score"] = f"{pair_result['post_attack_refusal_score']:.4f}"
+            row["pair_asr"]   = f"{pair_result['asr']:.4f}"
+        if renellm_result:
+            row["renellm_asr"] = f"{renellm_result['asr']:.4f}"
 
         file_exists = os.path.isfile(csv_path)
         with open(csv_path, "a", newline="") as f:
