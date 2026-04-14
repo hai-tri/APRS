@@ -146,7 +146,7 @@ def run_lm_harness(
         cmd = [
             _PYTHON, "-m", "lm_eval",
             "--model", "hf",
-            "--model_args", f"pretrained={model_path},dtype=bfloat16",
+            "--model_args", f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True",
             "--tasks", lm_task,
             "--num_fewshot", str(num_fewshot),
             "--batch_size", str(batch_size),
