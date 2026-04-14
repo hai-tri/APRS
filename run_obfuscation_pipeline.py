@@ -1254,7 +1254,7 @@ def run_pipeline(args):
         fieldnames = [
             "model", "defense_type", "projection_mode", "num_layers", "per_layer_direction",
             "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
-            "max_cos_sim",
+            "max_cos_sim", "avg_cos_sim",
             "pca8_score_undefended", "pca8_score_defended",
             "perlayer_score_undefended", "perlayer_score_defended",
             "arditi_score_undefended", "arditi_score_defended",
@@ -1289,6 +1289,7 @@ def run_pipeline(args):
             "pertinent_layers": str(obf_result["pertinent_layers"]),
             "z_sum_norm": f"{obf_result['z_sum_norm']:.4f}",
             "max_cos_sim": f"{abl_result['max_cos_sim']:.4f}",
+            "avg_cos_sim": f"{abl_result['mean_cos_sim']:.4f}",
             "pca8_score_undefended": f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
             "pca8_score_defended": f"{adaptive_result['pca']['post_attack_refusal_score']:.4f}",
             "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
