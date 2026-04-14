@@ -43,7 +43,7 @@ def extract_refusal_direction(
     harmful_prompts: List[str],
     benign_prompts: List[str],
     positions: List[int] = [-1],
-    batch_size: int = 64,
+    batch_size: int = 128,
 ) -> Dict:
     """
     Run difference-in-means on the (possibly defended) model and return
@@ -91,7 +91,7 @@ def evaluate_abliteration_resistance(
     benign_prompts: List[str],
     original_direction: torch.Tensor,
     refusal_toks,
-    batch_size: int = 64,
+    batch_size: int = 128,
 ) -> Dict:
     """
     Full abliteration-resistance evaluation.

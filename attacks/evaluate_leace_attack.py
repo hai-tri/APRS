@@ -164,7 +164,7 @@ def _collect_last_token_activations(
     tokenize_fn,
     block_modules,
     prompts: List[str],
-    batch_size: int = 64,
+    batch_size: int = 128,
 ) -> torch.Tensor:
     """
     Collect last-token activations at every layer.
@@ -226,7 +226,7 @@ def leace_attack(
     benign_prompts: List[str],
     original_direction: torch.Tensor,
     refusal_toks,
-    batch_size: int = 64,
+    batch_size: int = 128,
     svd_tol: float = 0.01,
 ) -> Dict:
     """
