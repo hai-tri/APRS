@@ -36,7 +36,6 @@ from pipeline.config import Config
 from pipeline.model_utils.model_factory import construct_model_base
 from pipeline.submodules.generate_directions import generate_directions
 from pipeline.submodules.select_direction import select_direction, get_refusal_scores
-from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
 from pipeline.submodules.evaluate_loss import evaluate_loss
 from pipeline.utils.hook_utils import (
     get_activation_addition_input_pre_hook,
@@ -55,16 +54,7 @@ from evaluations.evaluate_integrity import (
     collect_pre_defense_measurements,
     evaluate_defense_integrity,
 )
-from attacks.evaluate_heretic_attack import run_heretic_attack
 from attacks.evaluate_leace_attack import leace_attack
-from attacks.evaluate_gcg import evaluate_gcg
-from attacks.evaluate_autodan import evaluate_autodan
-from attacks.evaluate_cipherchat import evaluate_cipherchat
-from attacks.evaluate_pair import evaluate_pair
-from attacks.evaluate_renellm import evaluate_renellm
-from evaluations.evaluate_harmbench import evaluate_harmbench_asr
-from benchmarks.evaluate_xstest import evaluate_xstest
-from benchmarks.evaluate_lm_harness import run_lm_harness
 
 
 def parse_arguments():
@@ -633,6 +623,8 @@ def run_pipeline(args):
     # Stage 4–5: Completions and loss evaluation (existing)
     # ==================================================================
     if not args.skip_evaluations:
+        from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
+
         print("=" * 60)
         print("Stage 4: Evaluating completions (defended model) …")
         print("=" * 60)
@@ -690,6 +682,8 @@ def run_pipeline(args):
     # ==================================================================
     harmbench_result = None
     if not args.skip_harmbench:
+        from evaluations.evaluate_harmbench import evaluate_harmbench_asr
+
         print("=" * 60)
         print("Stage 4b: HarmBench ASR evaluation (Mazeika et al. 2024) …")
         print("=" * 60)
@@ -710,6 +704,8 @@ def run_pipeline(args):
     # ==================================================================
     xstest_result = None
     if not args.skip_xstest:
+        from benchmarks.evaluate_xstest import evaluate_xstest
+
         print("=" * 60)
         print("Stage 4c: XSTest over-refusal evaluation (Röttger et al. 2023) …")
         print("=" * 60)
@@ -833,6 +829,8 @@ def run_pipeline(args):
     # ==================================================================
     gcg_result = None
     if args.gcg:
+        from attacks.evaluate_gcg import evaluate_gcg
+
         print("=" * 60)
         print("Stage 7c: Running GCG attack (Zou et al. 2023) …")
         print("=" * 60)
@@ -857,6 +855,8 @@ def run_pipeline(args):
     # ==================================================================
     autodan_result = None
     if args.autodan:
+        from attacks.evaluate_autodan import evaluate_autodan
+
         print("=" * 60)
         print("Stage 7d: Running AutoDAN-GA attack (Liu et al. 2023) …")
         print("=" * 60)
@@ -879,6 +879,8 @@ def run_pipeline(args):
     # ==================================================================
     cipherchat_result = None
     if args.cipherchat:
+        from attacks.evaluate_cipherchat import evaluate_cipherchat
+
         print("=" * 60)
         print("Stage 7e: Running CipherChat attack (Yuan et al. 2023) …")
         print("=" * 60)
@@ -896,6 +898,8 @@ def run_pipeline(args):
     # ==================================================================
     pair_result = None
     if args.pair:
+        from attacks.evaluate_pair import evaluate_pair
+
         print("=" * 60)
         print("Stage 7f: Running PAIR attack (Chao et al. 2023) …")
         print("=" * 60)
@@ -919,6 +923,8 @@ def run_pipeline(args):
     # ==================================================================
     renellm_result = None
     if args.renellm:
+        from attacks.evaluate_renellm import evaluate_renellm
+
         print("=" * 60)
         print("Stage 7g: Running ReNeLLM attack (Ding et al. 2023) …")
         print("=" * 60)
@@ -966,6 +972,8 @@ def run_pipeline(args):
     defended_model_path = os.path.join(obf_artifact_dir, "defended_model")
 
     if not args.skip_heretic:
+        from attacks.evaluate_heretic_attack import run_heretic_attack
+
         print("=" * 60)
         print("Stage 8: Saving defended model for Heretic attack …")
         print("=" * 60)
@@ -993,6 +1001,8 @@ def run_pipeline(args):
     # ==================================================================
     lm_harness_result = None
     if not args.skip_lm_harness:
+        from benchmarks.evaluate_lm_harness import run_lm_harness
+
         print("=" * 60)
         print("Stage 9: Utility benchmarks (lm-evaluation-harness) …")
         print("=" * 60)

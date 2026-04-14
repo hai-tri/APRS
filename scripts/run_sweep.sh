@@ -9,6 +9,9 @@
 #   --model      HuggingFace model ID (default: meta-llama/Meta-Llama-3-8B-Instruct)
 #   --output_dir Base directory for per-run CSVs & logs (default: $HOME/aprs_sweep)
 #   --attacks    If set, also runs GCG/AutoDAN/CipherChat/PAIR/ReNeLLM per run
+# Env:
+#   APRS_EXTRA_FLAGS Additional space-separated flags forwarded to
+#                    run_obfuscation_pipeline.py for every run
 #
 # Sweep design (40 runs) — each projection mode is tuned independently:
 #
@@ -40,6 +43,11 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL_ID="meta-llama/Meta-Llama-3-8B-Instruct"
 OUTPUT_BASE="$HOME/aprs_sweep"
 RUN_ATTACKS=0
+EXTRA_FLAGS_STR="${APRS_EXTRA_FLAGS:-}"
+_EXTRA_PIPELINE_FLAGS=()
+if [[ -n "$EXTRA_FLAGS_STR" ]]; then
+    read -r -a _EXTRA_PIPELINE_FLAGS <<< "$EXTRA_FLAGS_STR"
+fi
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -60,6 +68,7 @@ echo " APRS Hyperparameter Sweep — $(date)"                             | tee 
 echo " Model      : $MODEL_ID"                                          | tee -a "$MASTER_LOG"
 echo " Output dir : $OUTPUT_BASE"                                       | tee -a "$MASTER_LOG"
 echo " Attacks    : $RUN_ATTACKS"                                       | tee -a "$MASTER_LOG"
+echo " Extra args : ${EXTRA_FLAGS_STR:-<none>}"                         | tee -a "$MASTER_LOG"
 echo "================================================================" | tee -a "$MASTER_LOG"
 
 # Attack flags (appended when --attacks is set)
@@ -102,6 +111,7 @@ run_config() {
         --save_csv   "$csv_path" \
         "${cache_args[@]}" \
         "${extra_args[@]}" \
+        "${_EXTRA_PIPELINE_FLAGS[@]}" \
         "${_ATTACK_FLAGS[@]}" \
         2>&1 | tee "$log_path"
     local rc=$?
