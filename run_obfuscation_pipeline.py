@@ -46,6 +46,8 @@ from pipeline.utils.hook_utils import (
 from obfuscation_config import ObfuscationConfig
 from obfuscation_utils import ModelComponents
 from apply_obfuscation import apply_obfuscation
+from defenses.apply_surgical import apply_surgical
+from defenses.apply_cast import apply_cast
 from attacks.evaluate_abliteration import evaluate_abliteration_resistance
 from attacks.evaluate_adaptive_attack import run_all_adaptive_attacks
 from evaluations.evaluate_integrity import (
@@ -69,6 +71,21 @@ def parse_arguments():
         description="Run the full obfuscation-defense pipeline."
     )
     parser.add_argument("--model_path", type=str, required=True)
+
+    # Defense selection
+    parser.add_argument("--defense_type", type=str, default="obfuscation",
+                        choices=["obfuscation", "surgical", "cast"],
+                        help="Defense mechanism to evaluate (default: obfuscation)")
+    # Surgical hyperparameters
+    parser.add_argument("--surgical_ablation_coeff", type=float, default=1.0,
+                        help="Surgical ablation coefficient (default: 1.0)")
+    parser.add_argument("--surgical_actadd_coeff", type=float, default=0.0,
+                        help="Surgical activation addition coefficient (default: 0.0)")
+    # CAST hyperparameters
+    parser.add_argument("--cast_strength", type=float, default=1.5,
+                        help="CAST behavior vector strength (default: 1.5)")
+    parser.add_argument("--cast_threshold", type=float, default=0.02,
+                        help="CAST condition cosine similarity threshold (default: 0.02)")
 
     # Obfuscation hyperparameters
     parser.add_argument("--epsilon", type=float, default=0.1,
@@ -451,39 +468,93 @@ def run_pipeline(args):
         return
 
     # ==================================================================
-    # Stage 3: Apply obfuscation defense  (NEW)
+    # Stage 3: Apply defense
     # ==================================================================
     print("=" * 60)
-    print("Stage 3: Applying obfuscation defense …")
+    print(f"Stage 3: Applying defense ({args.defense_type}) …")
     print("=" * 60)
 
-    # Allow explicit layer override from CLI
-    explicit_layers = (
-        [int(x) for x in args.pertinent_layers.split(",")]
-        if args.pertinent_layers else None
-    )
+    # defense_hooks: (fwd_pre_hooks, fwd_hooks) injected into every eval call.
+    # Weight-baking defenses (obfuscation) leave these empty — the model weights
+    # already encode the defense.  Hook-based defenses (surgical, cast) populate
+    # these and leave the weights unchanged.
+    defense_fwd_pre_hooks: list = []
+    defense_fwd_hooks: list = []
 
-    obf_result = apply_obfuscation(
-        model=model_base.model,
-        tokenize_fn=model_base.tokenize_instructions_fn,
-        harmful_prompts=harmful_train,
-        harmless_prompts=None if args.harmful_only_calibration else harmless_train,
-        harmless_ratio=args.harmless_ratio,
-        mean_diffs=mean_diffs,
-        selected_pos=pos,
-        selected_layer=layer,
-        direction=direction,
-        cfg=obf_cfg,
-        ablation_scores=None if explicit_layers else ablation_scores,
-        explicit_layers=explicit_layers,
-    )
+    if args.defense_type == "obfuscation":
+        # Allow explicit layer override from CLI
+        explicit_layers = (
+            [int(x) for x in args.pertinent_layers.split(",")]
+            if args.pertinent_layers else None
+        )
 
-    obf_result["undefended_refusal_score"] = undefended_refusal_mean
-    obf_result["undefended_arditi_score"] = undefended_abl["arditi_refusal_score"]
-    obf_result["undefended_pca_attack"] = undefended_adaptive["pca"]["post_attack_refusal_score"]
-    obf_result["undefended_per_layer_attack"] = undefended_adaptive["per_layer"]["post_attack_refusal_score"]
-    with open(os.path.join(obf_artifact_dir, "obfuscation_result.json"), "w") as f:
-        json.dump(obf_result, f, indent=4)
+        obf_result = apply_obfuscation(
+            model=model_base.model,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_train,
+            harmless_prompts=None if args.harmful_only_calibration else harmless_train,
+            harmless_ratio=args.harmless_ratio,
+            mean_diffs=mean_diffs,
+            selected_pos=pos,
+            selected_layer=layer,
+            direction=direction,
+            cfg=obf_cfg,
+            ablation_scores=None if explicit_layers else ablation_scores,
+            explicit_layers=explicit_layers,
+        )
+        obf_result["undefended_refusal_score"] = undefended_refusal_mean
+        obf_result["undefended_arditi_score"] = undefended_abl["arditi_refusal_score"]
+        obf_result["undefended_pca_attack"] = undefended_adaptive["pca"]["post_attack_refusal_score"]
+        obf_result["undefended_per_layer_attack"] = undefended_adaptive["per_layer"]["post_attack_refusal_score"]
+        with open(os.path.join(obf_artifact_dir, "obfuscation_result.json"), "w") as f:
+            json.dump(obf_result, f, indent=4)
+
+    elif args.defense_type == "surgical":
+        surgical_result = apply_surgical(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            harmful_prompts=harmful_train,
+            harmless_prompts=harmless_train,
+            ablation_coeff=args.surgical_ablation_coeff,
+            actadd_coeff=args.surgical_actadd_coeff,
+            apply_all_layers=True,
+            artifact_dir=obf_artifact_dir,
+        )
+        defense_fwd_pre_hooks = surgical_result["fwd_pre_hooks"]
+        defense_fwd_hooks     = surgical_result["fwd_hooks"]
+        # Build a minimal obf_result stub for downstream compatibility
+        obf_result = {
+            "pertinent_layers": list(range(model_base.model.config.num_hidden_layers)),
+            "z_sum_norm": 0.0,
+            "num_writers_patched": 0,
+            "num_readers_patched": 0,
+            "undefended_refusal_score": undefended_refusal_mean,
+        }
+
+    elif args.defense_type == "cast":
+        cast_result = apply_cast(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            harmful_prompts=harmful_train,
+            harmless_prompts=harmless_train,
+            behavior_strength=args.cast_strength,
+            condition_threshold=args.cast_threshold,
+            preserve_norm=True,
+            artifact_dir=obf_artifact_dir,
+        )
+        defense_fwd_pre_hooks = cast_result["fwd_pre_hooks"]
+        defense_fwd_hooks     = cast_result["fwd_hooks"]
+        obf_result = {
+            "pertinent_layers": cast_result["condition_layers"],
+            "z_sum_norm": 0.0,
+            "num_writers_patched": 0,
+            "num_readers_patched": 0,
+            "undefended_refusal_score": undefended_refusal_mean,
+        }
 
     # ==================================================================
     # Stage 3b: Post-defense integrity evaluation  (NEW)
@@ -586,6 +657,8 @@ def run_pipeline(args):
         harmbench_result = evaluate_harmbench_asr(
             model=model_base.model,
             tokenize_fn=model_base.tokenize_instructions_fn,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             behaviors_csv=args.harmbench_csv,
             n_behaviors=args.harmbench_n,
             seed=args.seed,
@@ -604,6 +677,8 @@ def run_pipeline(args):
         xstest_result = evaluate_xstest(
             model=model_base.model,
             tokenize_fn=model_base.tokenize_instructions_fn,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             artifact_dir=obf_artifact_dir,
         )
 
@@ -1013,7 +1088,7 @@ def run_pipeline(args):
 
         csv_path = args.save_csv
         fieldnames = [
-            "model", "projection_mode", "num_layers", "per_layer_direction",
+            "model", "defense_type", "projection_mode", "num_layers", "per_layer_direction",
             "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
             "max_cos_sim",
             "pca8_score_undefended", "pca8_score_defended",
@@ -1041,7 +1116,8 @@ def run_pipeline(args):
 
         row = {
             "model": args.model_path,
-            "projection_mode": obf_cfg.projection_mode,
+            "defense_type": args.defense_type,
+            "projection_mode": obf_cfg.projection_mode if args.defense_type == "obfuscation" else "—",
             "num_layers": len(obf_result["pertinent_layers"]),
             "per_layer_direction": obf_cfg.per_layer_direction,
             "epsilon": obf_cfg.epsilon,
