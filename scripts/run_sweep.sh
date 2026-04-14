@@ -200,7 +200,7 @@ OUTPUT_BASE="$OUTPUT_BASE" python3 - <<'PYEOF' 2>&1 | tee -a "$MASTER_LOG"
 import csv, glob, os
 
 output_base = os.environ["OUTPUT_BASE"]
-all_rows, header = [], None
+all_rows, all_keys = [], []
 
 for csv_path in sorted(glob.glob(os.path.join(output_base, "sweep*.csv"))):
     sweep_tag = os.path.splitext(os.path.basename(csv_path))[0]
@@ -209,18 +209,22 @@ for csv_path in sorted(glob.glob(os.path.join(output_base, "sweep*.csv"))):
             rows = list(csv.DictReader(f))
         if not rows:
             continue
-        if header is None:
-            header = list(rows[0].keys()) + ["sweep_tag"]
+        for k in rows[0].keys():
+            if k not in all_keys:
+                all_keys.append(k)
         for r in rows:
             r["sweep_tag"] = sweep_tag
             all_rows.append(r)
     except Exception as e:
         print(f"[WARN] {csv_path}: {e}")
 
+if "sweep_tag" not in all_keys:
+    all_keys.append("sweep_tag")
+
 if all_rows:
     out = os.path.join(output_base, "all_results.csv")
     with open(out, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore", restval="")
         writer.writeheader()
         writer.writerows(all_rows)
     print(f"Wrote {len(all_rows)} rows → {out}")
