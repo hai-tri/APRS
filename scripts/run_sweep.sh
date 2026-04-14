@@ -116,6 +116,7 @@ run_config() {
     python3 -u "$REPO_DIR/run_obfuscation_pipeline.py" \
         --model_path "$MODEL_ID" \
         --save_csv   "$csv_path" \
+        --skip_heretic \
         "${cache_args[@]}" \
         "${extra_args[@]}" \
         "${_EXTRA_PIPELINE_FLAGS[@]}" \
