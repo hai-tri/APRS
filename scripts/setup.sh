@@ -61,6 +61,7 @@ $PIP_BIN install --quiet \
     "jaxtyping>=0.2" \
     "einops>=0.8" \
     "matplotlib>=3.8" \
+    "jinja2>=3.1.4" \
     "safetensors>=0.4" \
     "huggingface-hub>=0.23"
 
