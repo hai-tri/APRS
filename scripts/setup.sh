@@ -47,9 +47,9 @@ $PIP_BIN install --quiet --upgrade pip setuptools wheel
 $PIP_BIN install --quiet \
     "numpy<2" \
     "scipy>=1.11,<1.14" \
-    "transformers==4.44.2" \
+    "transformers==4.46.3" \
     "datasets>=2.19,<3" \
-    "accelerate>=0.31,<1" \
+    "accelerate>=1.13.0" \
     "peft>=0.10" \
     "optuna>=3,<5" \
     "tqdm>=4.66" \
@@ -63,7 +63,13 @@ $PIP_BIN install --quiet \
     "matplotlib>=3.8" \
     "jinja2>=3.1.4" \
     "safetensors>=0.4" \
-    "huggingface-hub>=0.23"
+    "huggingface-hub>=0.23" \
+    "fsspec[http]==2024.6.1" \
+    "zstandard>=0.22" \
+    "pydantic>=2" \
+    "pydantic-settings>=2" \
+    "bitsandbytes>=0.43" \
+    "questionary>=2"
 
 echo "[setup] Skipping refusal_direction/requirements.txt because it pins"
 echo "        stale CUDA wheels that break on GH200/aarch64 environments."
