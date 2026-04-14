@@ -354,10 +354,9 @@ def evaluate_pair(
     if attacker_model_path:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         print(f"[PAIR] Loading attacker model: {attacker_model_path}")
-        device = next(model.parameters()).device
         attacker_tokenizer = AutoTokenizer.from_pretrained(attacker_model_path)
         attacker_model = AutoModelForCausalLM.from_pretrained(
-            attacker_model_path, torch_dtype=torch.float16, device_map=str(device),
+            attacker_model_path, torch_dtype=torch.bfloat16, device_map="auto",
         )
         attacker_model.eval()
     else:

@@ -46,7 +46,7 @@ class SoftOptConfig:
     lr: float = 0.001
     early_stop_loss: float = 0.01
     seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "mps"
+    device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
 
 def mellowmax(t: torch.Tensor, alpha=1.0, dim=-1):

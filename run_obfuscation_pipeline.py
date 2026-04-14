@@ -298,7 +298,7 @@ def run_pipeline(args):
 
     # Reduce loss eval batches — 2048 is excessive for a quick utility check
     cfg.ce_loss_batch_size = 4
-    cfg.ce_loss_n_batches = 64   # 64 batches × 4 = 256 sequences, ~1-2 min on MPS
+    cfg.ce_loss_n_batches = 64   # 64 batches × 4 = 256 sequences
 
     artifact_dir = cfg.artifact_path()
     obf_artifact_dir = os.path.join(artifact_dir, "obfuscation")
