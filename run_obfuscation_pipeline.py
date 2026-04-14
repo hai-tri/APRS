@@ -1,0 +1,919 @@
+"""
+Full pipeline for the Representational Obfuscation defense.
+
+Usage::
+
+    python run_obfuscation_pipeline.py --model_path meta-llama/Meta-Llama-3-8B-Instruct
+
+Pipeline stages:
+    1. generate_directions    — extract candidate refusal directions   (existing)
+    2. select_direction       — pick best r̂                            (existing)
+    2b. pre-defense integrity — collect residual stats & logits        (NEW)
+    3. apply_obfuscation      — apply the defense                      (NEW)
+    3b. post-defense integrity— variance diffs & output KL             (NEW)
+    4. completions            — evaluate refusal on harmful/harmless    (existing)
+    5. loss_evals             — evaluate utility                       (existing)
+    5b. llamaguard            — Llama Guard safety classification        (NEW)
+    6. evaluate_abliteration  — standard abliteration on defended model (NEW)
+    7. evaluate_adaptive      — PCA / per-layer / sublayer attacks      (NEW)
+"""
+
+import argparse
+import functools
+import json
+import os
+import random
+import sys
+import torch
+
+# Add the existing refusal_direction package to the path
+_REFUSAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refusal_direction")
+if _REFUSAL_DIR not in sys.path:
+    sys.path.insert(0, _REFUSAL_DIR)
+
+from dataset.load_dataset import load_dataset
+from pipeline.config import Config
+from pipeline.model_utils.model_factory import construct_model_base
+from pipeline.submodules.generate_directions import generate_directions
+from pipeline.submodules.select_direction import select_direction, get_refusal_scores
+from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
+from pipeline.submodules.evaluate_loss import evaluate_loss
+from pipeline.utils.hook_utils import (
+    get_activation_addition_input_pre_hook,
+    get_all_direction_ablation_hooks,
+)
+
+from obfuscation_config import ObfuscationConfig
+from obfuscation_utils import ModelComponents
+from apply_obfuscation import apply_obfuscation
+from attacks.evaluate_abliteration import evaluate_abliteration_resistance
+from attacks.evaluate_adaptive_attack import run_all_adaptive_attacks
+from evaluations.evaluate_integrity import (
+    collect_pre_defense_measurements,
+    evaluate_defense_integrity,
+)
+from attacks.evaluate_heretic_attack import run_heretic_attack
+from attacks.evaluate_leace_attack import leace_attack
+from evaluations.evaluate_harmbench import evaluate_harmbench_asr
+from benchmarks.evaluate_xstest import evaluate_xstest
+from benchmarks.evaluate_lm_harness import run_lm_harness
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Run the full obfuscation-defense pipeline."
+    )
+    parser.add_argument("--model_path", type=str, required=True)
+
+    # Obfuscation hyperparameters
+    parser.add_argument("--epsilon", type=float, default=0.1,
+                        help="Std of random alias vectors (default: 0.1)")
+    parser.add_argument("--num_pertinent_layers", type=int, default=None,
+                        help="Override number of pertinent layers (default: auto-detect from data)")
+    parser.add_argument("--num_calibration_prompts", type=int, default=32,
+                        help="Number of prompts for calibration (default: 32)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--patch_writers", type=str, default="both",
+                        choices=["both", "attn_only", "mlp_only"])
+    parser.add_argument("--no_separate_aliases", action="store_true",
+                        help="Use the same alias for W_O and W_down")
+    parser.add_argument("--pca_top_k", type=int, default=8,
+                        help="Number of PCA directions for the adaptive attack")
+    parser.add_argument("--pertinent_layers", type=str, default=None,
+                        help="Comma-separated list of specific layers to patch, e.g. '9,10'")
+    parser.add_argument("--projection_mode", type=str, default="hadamard",
+                        choices=["hadamard", "binary", "mask", "scalar_projection", "full"],
+                        help="Projection mode: hadamard (default), binary, mask, scalar_projection, or full")
+    parser.add_argument("--per_layer_direction", action="store_true",
+                        help="Use per-layer refusal directions instead of global r̂")
+
+    # Pipeline control
+    parser.add_argument("--skip_direction_extraction", action="store_true",
+                        help="Skip direction extraction if artifacts already exist")
+    parser.add_argument("--harmful_only_calibration", action="store_true",
+                        help="Calibrate rank-one patches on harmful prompts only (ablation baseline)")
+    parser.add_argument("--harmless_ratio", type=float, default=0.5,
+                        help="Fraction of calibration prompts drawn from harmless set (default: 0.5)")
+    parser.add_argument("--skip_evaluations", action="store_true",
+                        help="Skip completion/loss evaluations")
+    parser.add_argument("--undefended_only", action="store_true",
+                        help="Run only undefended baseline evaluations (no defense applied)")
+    parser.add_argument("--llamaguard", action="store_true",
+                        help="Run Llama Guard evaluation on completions (Stage 5b)")
+    parser.add_argument("--llamaguard_model", type=str, default="meta-llama/Llama-Guard-3-8B",
+                        help="Llama Guard model ID (default: meta-llama/Llama-Guard-3-8B)")
+    parser.add_argument("--softopt", action="store_true",
+                        help="Run SoftOpt white-box attack evaluation (Stage 7b)")
+    parser.add_argument("--softopt_steps", type=int, default=500,
+                        help="SoftOpt optimization steps (default: 500)")
+    parser.add_argument("--softopt_limit", type=int, default=None,
+                        help="Limit number of SoftOpt behaviors to test")
+    parser.add_argument("--softopt_benchmark", type=str,
+                        default=os.path.join(os.path.dirname(__file__), "data", "harmbench_test_std.json"),
+                        help="Path to HarmBench-format benchmark JSON")
+    parser.add_argument("--skip_harmbench", action="store_true",
+                        help="Skip HarmBench ASR evaluation (Stage 4b)")
+    parser.add_argument("--skip_xstest", action="store_true",
+                        help="Skip XSTest over-refusal evaluation (Stage 4c)")
+    parser.add_argument("--skip_lm_harness", action="store_true",
+                        help="Skip GSM8k/MATH500/MMLU evaluation (Stage 9)")
+    parser.add_argument("--lm_harness_tasks", type=str, default="gsm8k,math500,mmlu",
+                        help="Comma-separated lm-harness tasks to run (default: gsm8k,math500,mmlu)")
+    parser.add_argument("--lm_harness_n", type=int, default=100,
+                        help="Number of examples to sample per task (default: 100)")
+    parser.add_argument("--harmbench_csv", type=str,
+                        default=os.path.join(os.path.dirname(__file__), "data", "harmbench_behaviors_text_test.csv"),
+                        help="Path to HarmBench behaviors CSV")
+    parser.add_argument("--harmbench_n", type=int, default=100,
+                        help="Number of HarmBench behaviors to sample (default: 100)")
+    parser.add_argument("--skip_leace", action="store_true",
+                        help="Skip LEACE attack evaluation (Stage 7c)")
+    parser.add_argument("--skip_heretic", action="store_true",
+                        help="Skip Heretic attack evaluation (Stage 8)")
+    parser.add_argument("--heretic_trials", type=int, default=50,
+                        help="Number of Heretic Optuna trials (default: 50)")
+    parser.add_argument("--save_csv", type=str, default=None,
+                        help="Path to CSV file to append results to (e.g. results.csv)")
+    return parser.parse_args()
+
+
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def load_mlabonne_datasets(n_train=128, n_val=32, seed=42):
+    """
+    Load harmful/harmless datasets from mlabonne's HuggingFace repos
+    (same sources used by Heretic).
+
+      - harmful:  mlabonne/harmful_behaviors
+      - harmless: mlabonne/harmless_alpaca
+    """
+    from datasets import load_dataset as hf_load_dataset
+
+    print("[data] Loading mlabonne/harmful_behaviors …")
+    harmful_ds = hf_load_dataset("mlabonne/harmful_behaviors", split="train")
+    # Both mlabonne datasets use a 'text' column (confirmed from Heretic config)
+    col = "text" if "text" in harmful_ds.column_names else "instruction"
+    harmful_all = [row[col] for row in harmful_ds]
+
+    print("[data] Loading mlabonne/harmless_alpaca …")
+    harmless_ds = hf_load_dataset("mlabonne/harmless_alpaca", split="train")
+    col = "text" if "text" in harmless_ds.column_names else "instruction"
+    harmless_all = [row[col] for row in harmless_ds]
+
+    random.seed(seed)
+    random.shuffle(harmful_all)
+    random.shuffle(harmless_all)
+
+    harmful_train = harmful_all[:n_train]
+    harmful_val = harmful_all[n_train : n_train + n_val]
+    harmless_train = harmless_all[:n_train]
+    harmless_val = harmless_all[n_train : n_train + n_val]
+
+    print(f"[data] harmful  — train: {len(harmful_train)}, val: {len(harmful_val)} "
+          f"(total available: {len(harmful_all)})")
+    print(f"[data] harmless — train: {len(harmless_train)}, val: {len(harmless_val)} "
+          f"(total available: {len(harmless_all)})")
+
+    return harmful_train, harmless_train, harmful_val, harmless_val
+
+
+def filter_data(model_base, harmful_train, harmless_train, harmful_val, harmless_val):
+    """Keep only harmful prompts the model actually refuses and harmless prompts it doesn't."""
+    def filter_examples(dataset, scores, threshold, comparison):
+        return [inst for inst, score in zip(dataset, scores.tolist()) if comparison(score, threshold)]
+
+    harmful_train_scores = get_refusal_scores(
+        model_base.model, harmful_train,
+        model_base.tokenize_instructions_fn, model_base.refusal_toks,
+    )
+    harmless_train_scores = get_refusal_scores(
+        model_base.model, harmless_train,
+        model_base.tokenize_instructions_fn, model_base.refusal_toks,
+    )
+    harmful_train = filter_examples(harmful_train, harmful_train_scores, 0, lambda x, y: x > y)
+    harmless_train = filter_examples(harmless_train, harmless_train_scores, 0, lambda x, y: x < y)
+
+    harmful_val_scores = get_refusal_scores(
+        model_base.model, harmful_val,
+        model_base.tokenize_instructions_fn, model_base.refusal_toks,
+    )
+    harmless_val_scores = get_refusal_scores(
+        model_base.model, harmless_val,
+        model_base.tokenize_instructions_fn, model_base.refusal_toks,
+    )
+    harmful_val = filter_examples(harmful_val, harmful_val_scores, 0, lambda x, y: x > y)
+    harmless_val = filter_examples(harmless_val, harmless_val_scores, 0, lambda x, y: x < y)
+
+    return harmful_train, harmless_train, harmful_val, harmless_val
+
+
+def run_pipeline(args):
+    model_alias = os.path.basename(args.model_path)
+    cfg = Config(model_alias=model_alias, model_path=args.model_path)
+
+    obf_cfg = ObfuscationConfig(
+        epsilon=args.epsilon,
+        num_pertinent_layers=args.num_pertinent_layers,
+        num_calibration_prompts=args.num_calibration_prompts,
+        separate_attn_mlp_aliases=not args.no_separate_aliases,
+        seed=args.seed,
+        patch_writers=args.patch_writers,
+        projection_mode=args.projection_mode,
+        per_layer_direction=args.per_layer_direction,
+    )
+
+    # Match Heretic's dataset sizes: 400 for direction extraction, 100 for val
+    cfg.n_train = 400
+    cfg.n_val = 100
+
+    # Reduce loss eval batches — 2048 is excessive for a quick utility check
+    cfg.ce_loss_batch_size = 4
+    cfg.ce_loss_n_batches = 64   # 64 batches × 4 = 256 sequences, ~1-2 min on MPS
+
+    artifact_dir = cfg.artifact_path()
+    obf_artifact_dir = os.path.join(artifact_dir, "obfuscation")
+    os.makedirs(obf_artifact_dir, exist_ok=True)
+
+    # Save obfuscation config
+    with open(os.path.join(obf_artifact_dir, "obfuscation_config.json"), "w") as f:
+        json.dump(obf_cfg.__dict__, f, indent=4)
+
+    # ==================================================================
+    # Load model and datasets
+    # ==================================================================
+    print("=" * 60)
+    print("Loading model and datasets …")
+    print("=" * 60)
+
+    model_base = construct_model_base(cfg.model_path)
+
+    # Inject system prompt into the tokenizer
+    model_base.tokenize_instructions_fn = functools.partial(
+        model_base.tokenize_instructions_fn, system=SYSTEM_PROMPT,
+    )
+    print(f"[config] System prompt: \"{SYSTEM_PROMPT}\"")
+
+    # Load mlabonne datasets
+    harmful_train, harmless_train, harmful_val, harmless_val = load_mlabonne_datasets(
+        n_train=cfg.n_train, n_val=cfg.n_val,
+    )
+    harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
+        model_base, harmful_train, harmless_train, harmful_val, harmless_val,
+    )
+
+    # ==================================================================
+    # Stage 1–2: Generate / select refusal direction (existing pipeline)
+    # ==================================================================
+    gen_dir = os.path.join(artifact_dir, "generate_directions")
+    mean_diffs_path = os.path.join(gen_dir, "mean_diffs.pt")
+    direction_path = os.path.join(artifact_dir, "direction.pt")
+
+    if args.skip_direction_extraction and os.path.exists(direction_path):
+        print("Loading cached direction artifacts …")
+        mean_diffs = torch.load(mean_diffs_path, map_location="cpu")
+        direction = torch.load(direction_path, map_location="cpu")
+        with open(os.path.join(artifact_dir, "direction_metadata.json")) as f:
+            meta = json.load(f)
+        pos, layer = meta["pos"], meta["layer"]
+    else:
+        print("=" * 60)
+        print("Stage 1: Generating candidate refusal directions …")
+        print("=" * 60)
+        os.makedirs(gen_dir, exist_ok=True)
+        mean_diffs = generate_directions(
+            model_base, harmful_train, harmless_train,
+            artifact_dir=gen_dir,
+        )
+        torch.save(mean_diffs, mean_diffs_path)
+
+        print("=" * 60)
+        print("Stage 2: Selecting best refusal direction …")
+        print("=" * 60)
+        sel_dir = os.path.join(artifact_dir, "select_direction")
+        os.makedirs(sel_dir, exist_ok=True)
+        pos, layer, direction = select_direction(
+            model_base, harmful_val, harmless_val,
+            mean_diffs, artifact_dir=sel_dir,
+        )
+        with open(os.path.join(artifact_dir, "direction_metadata.json"), "w") as f:
+            json.dump({"pos": pos, "layer": layer}, f, indent=4)
+        torch.save(direction, direction_path)
+
+    # Load ablation scores produced by select_direction — used for causal layer selection
+    ablation_scores_path = os.path.join(artifact_dir, "select_direction", "direction_evaluations.json")
+    ablation_scores = None
+    if os.path.exists(ablation_scores_path):
+        with open(ablation_scores_path) as f:
+            ablation_scores = json.load(f)
+        print(f"Loaded {len(ablation_scores)} ablation score entries for causal layer selection.")
+
+    # Keep a copy of the original direction for diagnostics
+    original_direction = direction.clone()
+
+    print(f"\nRefusal direction: pos={pos}, layer={layer}, "
+          f"||r||={direction.norm().item():.4f}")
+
+    # ==================================================================
+    # Stage 2b: Pre-defense integrity measurements  (NEW)
+    # ==================================================================
+    print("=" * 60)
+    print("Stage 2b: Collecting pre-defense integrity measurements …")
+    print("=" * 60)
+
+    components = ModelComponents(model_base.model)
+    pre_measurements = collect_pre_defense_measurements(
+        model=model_base.model,
+        components=components,
+        harmful_prompts=harmful_val,
+        harmless_prompts=harmless_val,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
+    )
+
+    # Measure undefended refusal score (before defense is applied)
+    print("[pre-defense] Measuring undefended refusal score …")
+    undefended_refusal_scores = get_refusal_scores(
+        model_base.model, harmful_val,
+        model_base.tokenize_instructions_fn, model_base.refusal_toks,
+    )
+    undefended_refusal_mean = undefended_refusal_scores.mean().item()
+    print(f"[pre-defense] Undefended refusal score: {undefended_refusal_mean:.4f}")
+
+    # Run attacks on the undefended model as baselines
+    print("[pre-defense] Running attacks on undefended model …")
+    undefended_abl = evaluate_abliteration_resistance(
+        model=model_base.model,
+        tokenizer=model_base.tokenizer,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        block_modules=model_base.model_block_modules,
+        attn_modules=model_base.model_attn_modules,
+        mlp_modules=model_base.model_mlp_modules,
+        harmful_prompts=harmful_val,
+        benign_prompts=harmless_val,
+        original_direction=original_direction,
+        refusal_toks=model_base.refusal_toks,
+    )
+    undefended_adaptive = run_all_adaptive_attacks(
+        model=model_base.model,
+        tokenizer=model_base.tokenizer,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        block_modules=model_base.model_block_modules,
+        attn_modules=model_base.model_attn_modules,
+        mlp_modules=model_base.model_mlp_modules,
+        harmful_prompts=harmful_val,
+        benign_prompts=harmless_val,
+        original_direction=original_direction,
+        refusal_toks=model_base.refusal_toks,
+        pca_top_k=args.pca_top_k,
+    )
+    print(f"[pre-defense] Undefended post-abliteration: "
+          f"{undefended_abl['arditi_refusal_score']:.4f}")
+    print(f"[pre-defense] Undefended PCA-{args.pca_top_k}: "
+          f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}")
+    print(f"[pre-defense] Undefended per-layer: "
+          f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}")
+
+    undefended_leace = None
+    if not args.skip_leace:
+        print("[pre-defense] Running LEACE on undefended model …")
+        undefended_leace = leace_attack(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_val,
+            benign_prompts=harmless_val,
+            original_direction=original_direction,
+            refusal_toks=model_base.refusal_toks,
+        )
+        print(f"[pre-defense] Undefended LEACE: "
+              f"{undefended_leace['post_attack_refusal_score']:.4f}")
+
+    if args.undefended_only:
+        print("\n" + "=" * 60)
+        print("--undefended_only: Stopping after undefended baselines.")
+        print("=" * 60)
+        return
+
+    # ==================================================================
+    # Stage 3: Apply obfuscation defense  (NEW)
+    # ==================================================================
+    print("=" * 60)
+    print("Stage 3: Applying obfuscation defense …")
+    print("=" * 60)
+
+    # Allow explicit layer override from CLI
+    explicit_layers = (
+        [int(x) for x in args.pertinent_layers.split(",")]
+        if args.pertinent_layers else None
+    )
+
+    obf_result = apply_obfuscation(
+        model=model_base.model,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        harmful_prompts=harmful_train,
+        harmless_prompts=None if args.harmful_only_calibration else harmless_train,
+        harmless_ratio=args.harmless_ratio,
+        mean_diffs=mean_diffs,
+        selected_pos=pos,
+        selected_layer=layer,
+        direction=direction,
+        cfg=obf_cfg,
+        ablation_scores=None if explicit_layers else ablation_scores,
+        explicit_layers=explicit_layers,
+    )
+
+    obf_result["undefended_refusal_score"] = undefended_refusal_mean
+    obf_result["undefended_arditi_score"] = undefended_abl["arditi_refusal_score"]
+    obf_result["undefended_pca_attack"] = undefended_adaptive["pca"]["post_attack_refusal_score"]
+    obf_result["undefended_per_layer_attack"] = undefended_adaptive["per_layer"]["post_attack_refusal_score"]
+    with open(os.path.join(obf_artifact_dir, "obfuscation_result.json"), "w") as f:
+        json.dump(obf_result, f, indent=4)
+
+    # ==================================================================
+    # Stage 3b: Post-defense integrity evaluation  (NEW)
+    # ==================================================================
+    print("=" * 60)
+    print("Stage 3b: Evaluating defense integrity (variance + KL) …")
+    print("=" * 60)
+
+    integrity_result = evaluate_defense_integrity(
+        model=model_base.model,
+        components=components,
+        harmful_prompts=harmful_val,
+        harmless_prompts=harmless_val,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        pre_measurements=pre_measurements,
+        num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
+        pertinent_layers=obf_result["pertinent_layers"],
+        artifact_dir=obf_artifact_dir,
+    )
+
+    # Serialise (filter out non-JSON-safe types)
+    integrity_serialisable = {
+        "kl_harmful": integrity_result["kl_harmful"],
+        "kl_harmless": integrity_result["kl_harmless"],
+        "summary": {
+            k: v if not isinstance(v, list) else v
+            for k, v in integrity_result["summary"].items()
+        },
+        "residual_harmful": integrity_result["residual_harmful"],
+        "residual_harmless": integrity_result["residual_harmless"],
+    }
+    with open(os.path.join(obf_artifact_dir, "integrity_eval.json"), "w") as f:
+        json.dump(integrity_serialisable, f, indent=4)
+
+    # ==================================================================
+    # Stage 4–5: Completions and loss evaluation (existing)
+    # ==================================================================
+    if not args.skip_evaluations:
+        print("=" * 60)
+        print("Stage 4: Evaluating completions (defended model) …")
+        print("=" * 60)
+
+        completions_dir = os.path.join(obf_artifact_dir, "completions")
+        os.makedirs(completions_dir, exist_ok=True)
+
+        # Defended model — no hooks needed (defense is baked into weights)
+        for dataset_name in cfg.evaluation_datasets:
+            dataset = load_dataset(dataset_name)
+            completions = model_base.generate_completions(
+                dataset, fwd_pre_hooks=[], fwd_hooks=[],
+                max_new_tokens=cfg.max_new_tokens,
+            )
+            out_path = os.path.join(completions_dir, f"{dataset_name}_defended_completions.json")
+            with open(out_path, "w") as f:
+                json.dump(completions, f, indent=4)
+
+            evaluation = evaluate_jailbreak(
+                completions=completions,
+                methodologies=cfg.jailbreak_eval_methodologies,
+                evaluation_path=os.path.join(completions_dir, f"{dataset_name}_defended_evaluations.json"),
+            )
+            with open(os.path.join(completions_dir, f"{dataset_name}_defended_evaluations.json"), "w") as f:
+                json.dump(evaluation, f, indent=4)
+
+        print("=" * 60)
+        print("Stage 5: Evaluating loss (defended model) …")
+        print("=" * 60)
+
+        loss_dir = os.path.join(obf_artifact_dir, "loss_evals")
+        os.makedirs(loss_dir, exist_ok=True)
+
+        # Generate harmless completions for on-distribution loss
+        # Use harmless_val as test prompts (already loaded from mlabonne)
+        harmless_test = [{"instruction": p, "category": None} for p in harmless_val[:cfg.n_test]]
+        harmless_completions = model_base.generate_completions(
+            harmless_test, fwd_pre_hooks=[], fwd_hooks=[],
+            max_new_tokens=cfg.max_new_tokens,
+        )
+        harmless_comp_path = os.path.join(completions_dir, "harmless_defended_completions.json")
+        with open(harmless_comp_path, "w") as f:
+            json.dump(harmless_completions, f, indent=4)
+
+        loss_evals = evaluate_loss(
+            model_base, fwd_pre_hooks=[], fwd_hooks=[],
+            batch_size=cfg.ce_loss_batch_size, n_batches=cfg.ce_loss_n_batches,
+            completions_file_path=harmless_comp_path,
+        )
+        with open(os.path.join(loss_dir, "defended_loss_eval.json"), "w") as f:
+            json.dump(loss_evals, f, indent=4)
+
+    # ==================================================================
+    # Stage 4b: HarmBench ASR evaluation (Mazeika et al. 2024)
+    # ==================================================================
+    harmbench_result = None
+    if not args.skip_harmbench:
+        print("=" * 60)
+        print("Stage 4b: HarmBench ASR evaluation (Mazeika et al. 2024) …")
+        print("=" * 60)
+
+        harmbench_result = evaluate_harmbench_asr(
+            model=model_base.model,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            behaviors_csv=args.harmbench_csv,
+            n_behaviors=args.harmbench_n,
+            seed=args.seed,
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 4c: XSTest over-refusal evaluation (Röttger et al. 2023)
+    # ==================================================================
+    xstest_result = None
+    if not args.skip_xstest:
+        print("=" * 60)
+        print("Stage 4c: XSTest over-refusal evaluation (Röttger et al. 2023) …")
+        print("=" * 60)
+
+        xstest_result = evaluate_xstest(
+            model=model_base.model,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 5b: Llama Guard evaluation  (NEW)
+    # ==================================================================
+    llamaguard_result = None
+    if args.llamaguard and not args.skip_evaluations:
+        print("=" * 60)
+        print("Stage 5b: Running Llama Guard evaluation …")
+        print("=" * 60)
+
+        from evaluate_llamaguard import run_llamaguard_evaluation
+
+        completions_path = os.path.join(
+            obf_artifact_dir, "completions",
+            f"{cfg.evaluation_datasets[0]}_defended_completions.json",
+        )
+        llamaguard_output = os.path.join(
+            obf_artifact_dir, "completions", "llamaguard_evaluation.json",
+        )
+        llamaguard_result = run_llamaguard_evaluation(
+            completions_path=completions_path,
+            model_id=args.llamaguard_model,
+            output_path=llamaguard_output,
+        )
+
+    # ==================================================================
+    # Stage 6: Evaluate abliteration resistance  (NEW)
+    # ==================================================================
+    print("=" * 60)
+    print("Stage 6: Evaluating abliteration resistance …")
+    print("=" * 60)
+
+    abl_result = evaluate_abliteration_resistance(
+        model=model_base.model,
+        tokenizer=model_base.tokenizer,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        block_modules=model_base.model_block_modules,
+        attn_modules=model_base.model_attn_modules,
+        mlp_modules=model_base.model_mlp_modules,
+        harmful_prompts=harmful_val,
+        benign_prompts=harmless_val,
+        original_direction=original_direction,
+        refusal_toks=model_base.refusal_toks,
+    )
+
+    # Serialise (drop tensors)
+    abl_serialisable = {
+        k: v.tolist() if isinstance(v, torch.Tensor) else v
+        for k, v in abl_result.items()
+    }
+    with open(os.path.join(obf_artifact_dir, "abliteration_eval.json"), "w") as f:
+        json.dump(abl_serialisable, f, indent=4)
+
+    # ==================================================================
+    # Stage 7: Adaptive attacks  (NEW)
+    # ==================================================================
+    print("=" * 60)
+    print("Stage 7: Running adaptive attacks …")
+    print("=" * 60)
+
+    adaptive_result = run_all_adaptive_attacks(
+        model=model_base.model,
+        tokenizer=model_base.tokenizer,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        block_modules=model_base.model_block_modules,
+        attn_modules=model_base.model_attn_modules,
+        mlp_modules=model_base.model_mlp_modules,
+        harmful_prompts=harmful_val,
+        benign_prompts=harmless_val,
+        original_direction=original_direction,
+        refusal_toks=model_base.refusal_toks,
+        pca_top_k=args.pca_top_k,
+    )
+
+    adaptive_serialisable = {
+        k: {kk: vv.tolist() if isinstance(vv, torch.Tensor) else vv
+            for kk, vv in v.items()}
+        for k, v in adaptive_result.items()
+    }
+    with open(os.path.join(obf_artifact_dir, "adaptive_attacks.json"), "w") as f:
+        json.dump(adaptive_serialisable, f, indent=4)
+
+    # ==================================================================
+    # Stage 7b: LEACE concept-erasure attack (Marks et al. 2023)
+    # ==================================================================
+    leace_result = None
+    if not args.skip_leace:
+        print("=" * 60)
+        print("Stage 7b: Running LEACE attack (Marks et al. 2023) …")
+        print("=" * 60)
+
+        leace_result = leace_attack(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_val,
+            benign_prompts=harmless_val,
+            original_direction=original_direction,
+            refusal_toks=model_base.refusal_toks,
+        )
+
+        with open(os.path.join(obf_artifact_dir, "leace_attack.json"), "w") as f:
+            json.dump(leace_result, f, indent=4)
+
+    # ==================================================================
+    # Stage 7c: SoftOpt white-box attack  (NEW)
+    # ==================================================================
+    softopt_result = None
+    if args.softopt:
+        print("=" * 60)
+        print("Stage 7c: Running SoftOpt attack …")
+        print("=" * 60)
+
+        from evaluate_softopt import run_softopt_evaluation, SoftOptConfig
+
+        device = next(model_base.model.parameters()).device
+        softopt_cfg = SoftOptConfig(
+            num_steps=args.softopt_steps,
+            seed=args.seed,
+            device=str(device),
+        )
+        softopt_result = run_softopt_evaluation(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            benchmark_path=args.softopt_benchmark,
+            output_dir=obf_artifact_dir,
+            softopt_config=softopt_cfg,
+            limit=args.softopt_limit,
+        )
+
+    # ==================================================================
+    # Stage 8: Heretic attack  (NEW)
+    # ==================================================================
+    heretic_result = None
+    defended_model_path = os.path.join(obf_artifact_dir, "defended_model")
+
+    if not args.skip_heretic:
+        print("=" * 60)
+        print("Stage 8: Saving defended model for Heretic attack …")
+        print("=" * 60)
+
+        model_base.model.save_pretrained(defended_model_path)
+        model_base.tokenizer.save_pretrained(defended_model_path)
+        print(f"  Saved to: {defended_model_path}")
+
+        print("=" * 60)
+        print(f"Stage 8: Running Heretic attack ({args.heretic_trials} trials) …")
+        print("=" * 60)
+
+        heretic_result = run_heretic_attack(
+            defended_model_path=defended_model_path,
+            artifact_dir=obf_artifact_dir,
+            n_trials=args.heretic_trials,
+            system_prompt=SYSTEM_PROMPT,
+        )
+
+        with open(os.path.join(obf_artifact_dir, "heretic_attack.json"), "w") as f:
+            json.dump(heretic_result, f, indent=4)
+
+    # ==================================================================
+    # Stage 9: Utility benchmarks — GSM8k, MATH500, MMLU (lm-eval-harness)
+    # ==================================================================
+    lm_harness_result = None
+    if not args.skip_lm_harness:
+        print("=" * 60)
+        print("Stage 9: Utility benchmarks (lm-evaluation-harness) …")
+        print("=" * 60)
+
+        if not os.path.isdir(defended_model_path):
+            print(f"[lm-harness] Defended model not found at {defended_model_path}; "
+                  f"saving now …")
+            model_base.model.save_pretrained(defended_model_path)
+            model_base.tokenizer.save_pretrained(defended_model_path)
+
+        lm_harness_result = run_lm_harness(
+            model_path=defended_model_path,
+            tasks=args.lm_harness_tasks.split(","),
+            n_samples=args.lm_harness_n,
+            output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
+            seed=args.seed,
+        )
+
+    # ==================================================================
+    # Summary
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE — Summary")
+    print("=" * 60)
+    print(f"  Model              : {args.model_path}")
+    print(f"  Projection mode    : {obf_cfg.projection_mode}")
+    print(f"  Per-layer direction: {obf_cfg.per_layer_direction}")
+    print(f"  epsilon            : {obf_cfg.epsilon}")
+    print(f"  Pertinent layers   : {obf_result['pertinent_layers']}")
+    print(f"  z_sum norm         : {obf_result['z_sum_norm']:.4f}")
+    print(f"  Writers patched    : {obf_result['num_writers_patched']}")
+    print(f"  Readers patched    : {obf_result['num_readers_patched']}")
+
+    s = integrity_result["summary"]
+    print(f"  --- Integrity (variance + KL) ---")
+    print(f"  Harmful  mean |Δσ²/σ²| : "
+          f"attn={s.get('harmful_attn_mean_abs_var_shift', float('nan')):.6f}, "
+          f"mlp={s.get('harmful_mlp_mean_abs_var_shift', float('nan')):.6f}")
+    print(f"  Harmless mean |Δσ²/σ²| : "
+          f"attn={s.get('harmless_attn_mean_abs_var_shift', float('nan')):.6f}, "
+          f"mlp={s.get('harmless_mlp_mean_abs_var_shift', float('nan')):.6f}")
+    print(f"  Harmful  mean cos_sim  : "
+          f"attn={s.get('harmful_attn_mean_cos_sim', float('nan')):.6f}, "
+          f"mlp={s.get('harmful_mlp_mean_cos_sim', float('nan')):.6f}")
+    print(f"  Harmless mean cos_sim  : "
+          f"attn={s.get('harmless_attn_mean_cos_sim', float('nan')):.6f}, "
+          f"mlp={s.get('harmless_mlp_mean_cos_sim', float('nan')):.6f}")
+    print(f"  KL(orig||def) harmful  : {integrity_result['kl_harmful']['kl_forward_mean']:.6f}")
+    print(f"  KL(orig||def) harmless : {integrity_result['kl_harmless']['kl_forward_mean']:.6f}")
+    print(f"  JSD harmful            : {integrity_result['kl_harmful']['jsd_mean']:.6f}")
+    print(f"  JSD harmless           : {integrity_result['kl_harmless']['jsd_mean']:.6f}")
+
+    print(f"  --- Abliteration resistance ---")
+    print(f"                        Undefended → Defended")
+    print(f"  Refusal score      : {undefended_refusal_mean:.4f} → {abl_result['baseline_refusal_score']:.4f}")
+    print(f"  Arditi attack  : {undefended_abl['arditi_refusal_score']:.4f} → {abl_result['arditi_refusal_score']:.4f}")
+    print(f"  PCA-{args.pca_top_k} attack      : {undefended_adaptive['pca']['post_attack_refusal_score']:.4f} → {adaptive_result['pca']['post_attack_refusal_score']:.4f}")
+    print(f"  Per-layer attack   : {undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f} → {adaptive_result['per_layer']['post_attack_refusal_score']:.4f}")
+    print(f"  Max |cos_sim|      : {abl_result['max_cos_sim']:.4f}")
+
+    if leace_result:
+        undef_leace = undefended_leace['post_attack_refusal_score'] if undefended_leace else float('nan')
+        print(f"  --- LEACE attack (Marks et al.) ---")
+        print(f"  LEACE score        : {undef_leace:.4f} → {leace_result['post_attack_refusal_score']:.4f}")
+        print(f"  LEACE max |cos_sim|: {leace_result['max_cos_sim']:.4f}")
+
+    if softopt_result:
+        print(f"  --- SoftOpt attack ---")
+        print(f"  ASR (HarmBench)    : {softopt_result['softopt_asr']:.4f} "
+              f"({softopt_result['num_harmful']}/{softopt_result['total']})")
+        print(f"  Avg final loss     : {softopt_result['avg_final_loss']:.4f}")
+
+    if harmbench_result:
+        print(f"  --- HarmBench ASR (Mazeika et al.) ---")
+        print(f"  ASR                : {harmbench_result['asr']:.4f} "
+              f"({harmbench_result['n_harmful']}/{harmbench_result['n_total']})")
+
+    if xstest_result:
+        print(f"  --- XSTest over-refusal (Röttger et al.) ---")
+        print(f"  Over-refusal rate  : {xstest_result['over_refusal_rate']:.4f} "
+              f"({xstest_result['n_refused']}/{xstest_result['n_total']})")
+
+    if lm_harness_result:
+        print(f"  --- Utility benchmarks (lm-evaluation-harness) ---")
+        for task, metrics in lm_harness_result.items():
+            print(f"  {task:12s}: {metrics}")
+
+    if llamaguard_result:
+        print(f"  --- Llama Guard ---")
+        print(f"  ASR (unsafe rate)  : {llamaguard_result['llamaguard_asr']:.4f} "
+              f"({llamaguard_result['num_unsafe']}/{llamaguard_result['total']})")
+
+    if heretic_result:
+        print(f"  --- Heretic attack ---")
+        print(f"  Base refusals      : {heretic_result['base_refusals']}/{heretic_result['total_bad_prompts']} "
+              f"({heretic_result['base_refusals_pct']:.1f}%)")
+        print(f"  Best refusals      : {heretic_result['best_refusals']}/{heretic_result['total_bad_prompts']} "
+              f"({heretic_result['best_refusals_pct']:.1f}%)")
+        print(f"  Best KL            : {heretic_result['best_kl']:.4f}")
+
+    print(f"  Artifacts          : {obf_artifact_dir}")
+
+    # ==================================================================
+    # Save results to CSV
+    # ==================================================================
+    if args.save_csv:
+        import csv
+
+        csv_path = args.save_csv
+        fieldnames = [
+            "model", "projection_mode", "num_layers", "per_layer_direction",
+            "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
+            "max_cos_sim",
+            "pca8_score_undefended", "pca8_score_defended",
+            "perlayer_score_undefended", "perlayer_score_defended",
+            "arditi_score_undefended", "arditi_score_defended",
+            "leace_score_undefended", "leace_score_defended",
+            "kl_harmful", "kl_harmless",
+            "harmbench_asr",
+            "xstest_over_refusal_rate",
+            "gsm8k_exact_match",
+            "math500_exact_match",
+            "mmlu_acc",
+            "llamaguard_asr",
+            "softopt_asr",
+        ]
+
+        row = {
+            "model": args.model_path,
+            "projection_mode": obf_cfg.projection_mode,
+            "num_layers": len(obf_result["pertinent_layers"]),
+            "per_layer_direction": obf_cfg.per_layer_direction,
+            "epsilon": obf_cfg.epsilon,
+            "calibration_prompts": obf_cfg.num_calibration_prompts,
+            "pertinent_layers": str(obf_result["pertinent_layers"]),
+            "z_sum_norm": f"{obf_result['z_sum_norm']:.4f}",
+            "max_cos_sim": f"{abl_result['max_cos_sim']:.4f}",
+            "pca8_score_undefended": f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
+            "pca8_score_defended": f"{adaptive_result['pca']['post_attack_refusal_score']:.4f}",
+            "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
+            "perlayer_score_defended": f"{adaptive_result['per_layer']['post_attack_refusal_score']:.4f}",
+            "arditi_score_undefended": f"{undefended_abl['arditi_refusal_score']:.4f}",
+            "arditi_score_defended": f"{abl_result['arditi_refusal_score']:.4f}",
+            "kl_harmful": f"{integrity_result['kl_harmful']['kl_forward_mean']:.6f}",
+            "kl_harmless": f"{integrity_result['kl_harmless']['kl_forward_mean']:.6f}",
+            "leace_score_undefended": "",
+            "leace_score_defended": "",
+            "harmbench_asr": "",
+            "xstest_over_refusal_rate": "",
+            "gsm8k_exact_match": "",
+            "math500_exact_match": "",
+            "mmlu_acc": "",
+            "llamaguard_asr": "",
+            "softopt_asr": "",
+        }
+
+        if undefended_leace:
+            row["leace_score_undefended"] = f"{undefended_leace['post_attack_refusal_score']:.4f}"
+        if leace_result:
+            row["leace_score_defended"] = f"{leace_result['post_attack_refusal_score']:.4f}"
+        if harmbench_result:
+            row["harmbench_asr"] = f"{harmbench_result['asr']:.4f}"
+        if xstest_result:
+            row["xstest_over_refusal_rate"] = f"{xstest_result['over_refusal_rate']:.4f}"
+        if lm_harness_result:
+            if "gsm8k" in lm_harness_result:
+                v = lm_harness_result["gsm8k"].get("exact_match")
+                if v is not None:
+                    row["gsm8k_exact_match"] = f"{v:.4f}"
+            if "math500" in lm_harness_result:
+                v = lm_harness_result["math500"].get("exact_match")
+                if v is not None:
+                    row["math500_exact_match"] = f"{v:.4f}"
+            if "mmlu" in lm_harness_result:
+                v = lm_harness_result["mmlu"].get("acc")
+                if v is not None:
+                    row["mmlu_acc"] = f"{v:.4f}"
+
+        if llamaguard_result:
+            row["llamaguard_asr"] = f"{llamaguard_result['llamaguard_asr']:.4f}"
+        if softopt_result:
+            row["softopt_asr"] = f"{softopt_result['softopt_asr']:.4f}"
+
+        file_exists = os.path.isfile(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+        print(f"  Results appended   : {csv_path}")
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    run_pipeline(args)
