@@ -100,6 +100,13 @@ run_config() {
     echo "── $tag" | tee -a "$MASTER_LOG"
     echo "   args : ${extra_args[*]}" | tee -a "$MASTER_LOG"
 
+    # Resume: skip if CSV already exists and is non-empty
+    if [[ -s "$csv_path" ]]; then
+        echo "   [SKIP] already complete → $csv_path" | tee -a "$MASTER_LOG"
+        _DIRECTION_READY=1
+        return
+    fi
+
     local cache_args=()
     if [[ $_DIRECTION_READY -eq 1 ]]; then
         cache_args=(--skip_direction_extraction)
