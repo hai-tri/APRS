@@ -128,12 +128,12 @@ def evaluate_abliteration_resistance(
     # --- Cosine similarity diagnostic ---
     original_direction = original_direction.float().to("cpu")
     mean_diffs_defended = result["mean_diffs"][-1]  # (n_layers, d_model)
+    o_norm = original_direction / (original_direction.norm() + 1e-8)
 
     cos_sims = torch.zeros(num_layers)
     for ell in range(num_layers):
-        d_ell = mean_diffs_defended[ell].float()
+        d_ell = mean_diffs_defended[ell].float().to("cpu")
         d_ell_norm = d_ell / (d_ell.norm() + 1e-8)
-        o_norm = original_direction / (original_direction.norm() + 1e-8)
         cos_sims[ell] = (d_ell_norm @ o_norm).item()
 
     print(f"[abliteration eval] Cosine similarities with original direction:")
