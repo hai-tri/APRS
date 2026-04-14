@@ -48,6 +48,7 @@ from obfuscation_utils import ModelComponents
 from apply_obfuscation import apply_obfuscation
 from defenses.apply_surgical import apply_surgical
 from defenses.apply_cast import apply_cast
+from defenses.apply_circuit_breakers import apply_circuit_breakers
 from attacks.evaluate_abliteration import evaluate_abliteration_resistance
 from attacks.evaluate_adaptive_attack import run_all_adaptive_attacks
 from evaluations.evaluate_integrity import (
@@ -74,7 +75,7 @@ def parse_arguments():
 
     # Defense selection
     parser.add_argument("--defense_type", type=str, default="obfuscation",
-                        choices=["obfuscation", "surgical", "cast"],
+                        choices=["obfuscation", "surgical", "cast", "circuit_breakers"],
                         help="Defense mechanism to evaluate (default: obfuscation)")
     # Surgical hyperparameters
     parser.add_argument("--surgical_ablation_coeff", type=float, default=1.0,
@@ -86,6 +87,19 @@ def parse_arguments():
                         help="CAST behavior vector strength (default: 1.5)")
     parser.add_argument("--cast_threshold", type=float, default=0.02,
                         help="CAST condition cosine similarity threshold (default: 0.02)")
+    # Circuit Breakers hyperparameters
+    parser.add_argument("--cb_steps", type=int, default=150,
+                        help="Circuit Breakers training steps (default: 150)")
+    parser.add_argument("--cb_lr", type=float, default=1e-4,
+                        help="Circuit Breakers learning rate (default: 1e-4)")
+    parser.add_argument("--cb_lora_rank", type=int, default=16,
+                        help="Circuit Breakers LoRA rank (default: 16)")
+    parser.add_argument("--cb_batch_size", type=int, default=4,
+                        help="Circuit Breakers training batch size (default: 4)")
+    parser.add_argument("--cb_coeff_max", type=float, default=1.0,
+                        help="Circuit Breakers peak RR loss coefficient (default: 1.0)")
+    parser.add_argument("--cb_retain_coeff_max", type=float, default=1.0,
+                        help="Circuit Breakers peak retention loss coefficient (default: 1.0)")
 
     # Obfuscation hyperparameters
     parser.add_argument("--epsilon", type=float, default=0.1,
@@ -550,6 +564,32 @@ def run_pipeline(args):
         defense_fwd_hooks     = cast_result["fwd_hooks"]
         obf_result = {
             "pertinent_layers": cast_result["condition_layers"],
+            "z_sum_norm": 0.0,
+            "num_writers_patched": 0,
+            "num_readers_patched": 0,
+            "undefended_refusal_score": undefended_refusal_mean,
+        }
+
+    elif args.defense_type == "circuit_breakers":
+        cb_result = apply_circuit_breakers(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            harmful_prompts=harmful_train,
+            harmless_prompts=harmless_train,
+            lora_rank=args.cb_lora_rank,
+            max_steps=args.cb_steps,
+            lr=args.cb_lr,
+            batch_size=args.cb_batch_size,
+            cb_coeff_max=args.cb_coeff_max,
+            retain_coeff_max=args.cb_retain_coeff_max,
+            merge_weights=True,
+            seed=args.seed,
+            artifact_dir=obf_artifact_dir,
+        )
+        # After merge_and_unload the returned model replaces model_base.model
+        model_base.model = cb_result["model"]
+        obf_result = {
+            "pertinent_layers": list(range(model_base.model.config.num_hidden_layers)),
             "z_sum_norm": 0.0,
             "num_writers_patched": 0,
             "num_readers_patched": 0,
