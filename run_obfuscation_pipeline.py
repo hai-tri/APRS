@@ -467,8 +467,122 @@ def run_pipeline(args):
 
     if args.undefended_only:
         print("\n" + "=" * 60)
-        print("--undefended_only: Stopping after undefended baselines.")
+        print("--undefended_only: Running black-box attacks on undefended model …")
         print("=" * 60)
+
+        _undef_artifact_dir = os.path.join(
+            cfg.artifact_path(), "undefended"
+        )
+        os.makedirs(_undef_artifact_dir, exist_ok=True)
+
+        _undef_gcg = _undef_autodan = _undef_cipher = _undef_pair = _undef_renellm = None
+
+        if args.gcg:
+            from attacks.evaluate_gcg import evaluate_gcg
+            print("Stage U-1: GCG on undefended model …")
+            _undef_gcg = evaluate_gcg(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                harmful_prompts=harmful_val,
+                refusal_toks=model_base.refusal_toks,
+                suffix_len=args.gcg_suffix_len,
+                num_steps=args.gcg_steps,
+                topk=args.gcg_topk,
+                batch_size=args.gcg_batch_size,
+                n_behaviors=args.gcg_n_behaviors,
+                seed=args.seed,
+                artifact_dir=_undef_artifact_dir,
+            )
+
+        if args.autodan:
+            from attacks.evaluate_autodan import evaluate_autodan
+            print("Stage U-2: AutoDAN on undefended model …")
+            _undef_autodan = evaluate_autodan(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                harmful_prompts=harmful_val,
+                refusal_toks=model_base.refusal_toks,
+                population_size=args.autodan_population,
+                num_steps=args.autodan_steps,
+                n_behaviors=args.autodan_n_behaviors,
+                seed=args.seed,
+                artifact_dir=_undef_artifact_dir,
+            )
+
+        if args.cipherchat:
+            from attacks.evaluate_cipherchat import evaluate_cipherchat
+            print("Stage U-3: CipherChat on undefended model …")
+            _undef_cipher = evaluate_cipherchat(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                harmful_prompts=harmful_val,
+                ciphers=args.cipherchat_ciphers.split(","),
+                artifact_dir=_undef_artifact_dir,
+            )
+
+        if args.pair:
+            from attacks.evaluate_pair import evaluate_pair
+            print("Stage U-4: PAIR on undefended model …")
+            _undef_pair = evaluate_pair(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                harmful_prompts=harmful_val,
+                refusal_toks=model_base.refusal_toks,
+                n_streams=args.pair_streams,
+                n_iterations=args.pair_iterations,
+                n_behaviors=args.pair_n_behaviors,
+                attacker_model_path=args.pair_attacker,
+                seed=args.seed,
+                artifact_dir=_undef_artifact_dir,
+            )
+
+        if args.renellm:
+            from attacks.evaluate_renellm import evaluate_renellm
+            print("Stage U-5: ReNeLLM on undefended model …")
+            _undef_renellm = evaluate_renellm(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                harmful_prompts=harmful_val,
+                n_rewrite_strategies=args.renellm_strategies,
+                n_scenario_attempts=args.renellm_attempts,
+                seed=args.seed,
+                artifact_dir=_undef_artifact_dir,
+            )
+
+        # Write CSV row for the undefended baseline
+        if args.save_csv:
+            import csv as _csv
+            row = {
+                "defense_type":        "none",
+                "projection_mode":     "none",
+                "epsilon":             0.0,
+                "num_calibration_prompts": 0,
+                "per_layer_direction": False,
+                "undefended_refusal_score": undefended_refusal_mean,
+                "undefended_arditi_score":  undefended_abl["arditi_refusal_score"],
+                "undefended_pca_attack":    undefended_adaptive["pca"]["post_attack_refusal_score"],
+                "undefended_per_layer_attack": undefended_adaptive["per_layer"]["post_attack_refusal_score"],
+                "gcg_score":  _undef_gcg["post_attack_refusal_score"] if _undef_gcg else "",
+                "gcg_asr":    _undef_gcg["asr"] if _undef_gcg else "",
+                "autodan_score": _undef_autodan["post_attack_refusal_score"] if _undef_autodan else "",
+                "autodan_asr":   _undef_autodan["asr"] if _undef_autodan else "",
+                "cipherchat_best_asr":    _undef_cipher["best_asr"] if _undef_cipher else "",
+                "cipherchat_best_cipher": _undef_cipher["best_cipher"] if _undef_cipher else "",
+                "pair_score": _undef_pair["post_attack_refusal_score"] if _undef_pair else "",
+                "pair_asr":   _undef_pair["asr"] if _undef_pair else "",
+                "renellm_asr": _undef_renellm["asr"] if _undef_renellm else "",
+            }
+            file_exists = os.path.isfile(args.save_csv)
+            with open(args.save_csv, "a", newline="") as f:
+                writer = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+
+        print("\n--undefended_only: Done.")
         return
 
     # ==================================================================
