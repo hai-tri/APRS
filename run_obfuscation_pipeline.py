@@ -54,6 +54,9 @@ from evaluations.evaluate_integrity import (
 )
 from attacks.evaluate_heretic_attack import run_heretic_attack
 from attacks.evaluate_leace_attack import leace_attack
+from attacks.evaluate_gcg import evaluate_gcg
+from attacks.evaluate_autodan import evaluate_autodan
+from attacks.evaluate_cipherchat import evaluate_cipherchat
 from evaluations.evaluate_harmbench import evaluate_harmbench_asr
 from benchmarks.evaluate_xstest import evaluate_xstest
 from benchmarks.evaluate_lm_harness import run_lm_harness
@@ -132,6 +135,34 @@ def parse_arguments():
                         help="Skip Heretic attack evaluation (Stage 8)")
     parser.add_argument("--heretic_trials", type=int, default=50,
                         help="Number of Heretic Optuna trials (default: 50)")
+    # GCG
+    parser.add_argument("--gcg", action="store_true",
+                        help="Run GCG white-box attack (Zou et al. 2023)")
+    parser.add_argument("--gcg_steps", type=int, default=500,
+                        help="GCG optimisation steps per behavior (default: 500)")
+    parser.add_argument("--gcg_suffix_len", type=int, default=20,
+                        help="GCG adversarial suffix length in tokens (default: 20)")
+    parser.add_argument("--gcg_n_behaviors", type=int, default=25,
+                        help="Number of behaviors to attack with GCG (default: 25)")
+    parser.add_argument("--gcg_topk", type=int, default=256,
+                        help="GCG candidate pool size per position (default: 256)")
+    parser.add_argument("--gcg_batch_size", type=int, default=128,
+                        help="GCG candidate batch size per step (default: 128)")
+    # AutoDAN
+    parser.add_argument("--autodan", action="store_true",
+                        help="Run AutoDAN-GA attack (Liu et al. 2023)")
+    parser.add_argument("--autodan_steps", type=int, default=100,
+                        help="AutoDAN GA generations (default: 100)")
+    parser.add_argument("--autodan_population", type=int, default=64,
+                        help="AutoDAN population size (default: 64)")
+    parser.add_argument("--autodan_n_behaviors", type=int, default=25,
+                        help="Number of behaviors to attack with AutoDAN (default: 25)")
+    # CipherChat
+    parser.add_argument("--cipherchat", action="store_true",
+                        help="Run CipherChat black-box attack (Yuan et al. 2023)")
+    parser.add_argument("--cipherchat_ciphers", type=str, default="caesar,base64",
+                        help="Comma-separated cipher types to try: "
+                             "caesar,morse,ascii,base64 (default: caesar,base64)")
     parser.add_argument("--save_csv", type=str, default=None,
                         help="Path to CSV file to append results to (e.g. results.csv)")
     return parser.parse_args()
@@ -564,7 +595,7 @@ def run_pipeline(args):
         print("Stage 5b: Running Llama Guard evaluation …")
         print("=" * 60)
 
-        from evaluate_llamaguard import run_llamaguard_evaluation
+        from evaluations.evaluate_llamaguard import run_llamaguard_evaluation
 
         completions_path = os.path.join(
             obf_artifact_dir, "completions",
@@ -662,7 +693,70 @@ def run_pipeline(args):
             json.dump(leace_result, f, indent=4)
 
     # ==================================================================
-    # Stage 7c: SoftOpt white-box attack  (NEW)
+    # Stage 7c: GCG white-box attack (Zou et al. 2023)
+    # ==================================================================
+    gcg_result = None
+    if args.gcg:
+        print("=" * 60)
+        print("Stage 7c: Running GCG attack (Zou et al. 2023) …")
+        print("=" * 60)
+
+        gcg_result = evaluate_gcg(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_val,
+            refusal_toks=model_base.refusal_toks,
+            suffix_len=args.gcg_suffix_len,
+            num_steps=args.gcg_steps,
+            topk=args.gcg_topk,
+            batch_size=args.gcg_batch_size,
+            n_behaviors=args.gcg_n_behaviors,
+            seed=args.seed,
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 7d: AutoDAN-GA attack (Liu et al. 2023)
+    # ==================================================================
+    autodan_result = None
+    if args.autodan:
+        print("=" * 60)
+        print("Stage 7d: Running AutoDAN-GA attack (Liu et al. 2023) …")
+        print("=" * 60)
+
+        autodan_result = evaluate_autodan(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_val,
+            refusal_toks=model_base.refusal_toks,
+            population_size=args.autodan_population,
+            num_steps=args.autodan_steps,
+            n_behaviors=args.autodan_n_behaviors,
+            seed=args.seed,
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 7e: CipherChat black-box attack (Yuan et al. 2023)
+    # ==================================================================
+    cipherchat_result = None
+    if args.cipherchat:
+        print("=" * 60)
+        print("Stage 7e: Running CipherChat attack (Yuan et al. 2023) …")
+        print("=" * 60)
+
+        cipherchat_result = evaluate_cipherchat(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            harmful_prompts=harmful_val,
+            ciphers=args.cipherchat_ciphers.split(","),
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 7f: SoftOpt white-box attack
     # ==================================================================
     softopt_result = None
     if args.softopt:
@@ -670,7 +764,7 @@ def run_pipeline(args):
         print("Stage 7c: Running SoftOpt attack …")
         print("=" * 60)
 
-        from evaluate_softopt import run_softopt_evaluation, SoftOptConfig
+        from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
 
         device = next(model_base.model.parameters()).device
         softopt_cfg = SoftOptConfig(
@@ -787,6 +881,21 @@ def run_pipeline(args):
         print(f"  LEACE score        : {undef_leace:.4f} → {leace_result['post_attack_refusal_score']:.4f}")
         print(f"  LEACE max |cos_sim|: {leace_result['max_cos_sim']:.4f}")
 
+    if gcg_result:
+        print(f"  --- GCG attack (Zou et al.) ---")
+        print(f"  Post-attack refusal: {gcg_result['post_attack_refusal_score']:.4f}")
+        print(f"  ASR (target loss)  : {gcg_result['asr']:.4f}")
+
+    if autodan_result:
+        print(f"  --- AutoDAN-GA attack (Liu et al.) ---")
+        print(f"  Post-attack refusal: {autodan_result['post_attack_refusal_score']:.4f}")
+        print(f"  ASR (target loss)  : {autodan_result['asr']:.4f}")
+
+    if cipherchat_result:
+        print(f"  --- CipherChat attack (Yuan et al.) ---")
+        print(f"  Best ASR           : {cipherchat_result['best_asr']:.4f} "
+              f"({cipherchat_result['best_cipher']})")
+
     if softopt_result:
         print(f"  --- SoftOpt attack ---")
         print(f"  ASR (HarmBench)    : {softopt_result['softopt_asr']:.4f} "
@@ -846,6 +955,12 @@ def run_pipeline(args):
             "mmlu_acc",
             "llamaguard_asr",
             "softopt_asr",
+            "gcg_score",
+            "gcg_asr",
+            "autodan_score",
+            "autodan_asr",
+            "cipherchat_best_asr",
+            "cipherchat_best_cipher",
         ]
 
         row = {
@@ -875,6 +990,12 @@ def run_pipeline(args):
             "mmlu_acc": "",
             "llamaguard_asr": "",
             "softopt_asr": "",
+            "gcg_score": "",
+            "gcg_asr": "",
+            "autodan_score": "",
+            "autodan_asr": "",
+            "cipherchat_best_asr": "",
+            "cipherchat_best_cipher": "",
         }
 
         if undefended_leace:
@@ -903,6 +1024,15 @@ def run_pipeline(args):
             row["llamaguard_asr"] = f"{llamaguard_result['llamaguard_asr']:.4f}"
         if softopt_result:
             row["softopt_asr"] = f"{softopt_result['softopt_asr']:.4f}"
+        if gcg_result:
+            row["gcg_score"] = f"{gcg_result['post_attack_refusal_score']:.4f}"
+            row["gcg_asr"]   = f"{gcg_result['asr']:.4f}"
+        if autodan_result:
+            row["autodan_score"] = f"{autodan_result['post_attack_refusal_score']:.4f}"
+            row["autodan_asr"]   = f"{autodan_result['asr']:.4f}"
+        if cipherchat_result:
+            row["cipherchat_best_asr"]    = f"{cipherchat_result['best_asr']:.4f}"
+            row["cipherchat_best_cipher"] = cipherchat_result["best_cipher"] or ""
 
         file_exists = os.path.isfile(csv_path)
         with open(csv_path, "a", newline="") as f:
