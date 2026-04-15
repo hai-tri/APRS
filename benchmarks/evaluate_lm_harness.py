@@ -165,16 +165,17 @@ def run_lm_harness(
             results[task_key] = {"error": f"exit code {proc.returncode}"}
             continue
 
-        # Parse output JSON — lm_eval may nest under a timestamped subdir
+        # Parse output JSON — lm_eval writes to a timestamped subdir
         result_file = output_path
         if not os.path.exists(result_file):
             candidates = []
             for root, _, files in os.walk(output_dir):
                 for fname in files:
-                    if fname.endswith(".json") and task_key in root:
+                    if fname.endswith(".json") and "results" in fname:
                         candidates.append(os.path.join(root, fname))
+            # Prefer the most recently written results file
             if candidates:
-                result_file = sorted(candidates)[-1]
+                result_file = max(candidates, key=os.path.getmtime)
 
         if os.path.exists(result_file):
             with open(result_file) as f:
