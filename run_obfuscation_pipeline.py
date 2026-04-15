@@ -342,7 +342,11 @@ def run_pipeline(args):
     mean_diffs_path = os.path.join(gen_dir, "mean_diffs.pt")
     direction_path = os.path.join(artifact_dir, "direction.pt")
 
-    if args.skip_direction_extraction and os.path.exists(direction_path):
+    _meta_path = os.path.join(artifact_dir, "direction_metadata.json")
+    if (args.skip_direction_extraction
+            and os.path.exists(direction_path)
+            and os.path.exists(mean_diffs_path)
+            and os.path.exists(_meta_path)):
         print("Loading cached direction artifacts …")
         mean_diffs = torch.load(mean_diffs_path, map_location="cpu")
         direction = torch.load(direction_path, map_location="cpu")

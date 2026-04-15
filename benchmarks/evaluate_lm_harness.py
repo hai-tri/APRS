@@ -181,7 +181,7 @@ def run_lm_harness(
                 raw = json.load(f)
             task_results = raw.get("results", {}).get(lm_task, {})
             results[task_key] = _extract_metrics(task_key, task_results)
-            results[task_key]["n_samples"] = len(indices)
+            results[task_key]["n_samples"] = n_samples
             results[task_key]["seed"] = seed
             print(f"[lm-harness] {task_key}: {results[task_key]}")
         else:
