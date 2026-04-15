@@ -133,11 +133,10 @@ def run_lm_harness(
 
         lm_task, num_fewshot, _ = TASKS[task_key]
 
-        # Build seeded sample indices as inline JSON string for --samples flag
-        indices = _sample_indices(task_key, n_samples, seed)
-        samples_json = json.dumps({lm_task: indices})
-        print(f"[lm-harness] {task_key}: sampled {len(indices)} examples "
-              f"(seed={seed}, indices[0:5]={indices[:5]})")
+        # Use --limit to cap examples per task. --samples requires exact subtask
+        # keys (e.g. "mmlu_anatomy") and silently does nothing when passed the
+        # group name "mmlu", so --limit is the only reliable approach.
+        print(f"[lm-harness] {task_key}: limiting to {n_samples} examples (seed={seed})")
 
         output_path = os.path.join(output_dir, f"{task_key}_results.json")
 
@@ -151,13 +150,13 @@ def run_lm_harness(
             "--device", device,
             "--output_path", output_path,
             "--seed", str(seed),
-            "--samples", samples_json,
+            "--limit", str(n_samples),
             "--trust_remote_code",
             "--apply_chat_template",
         ]
 
         print(f"[lm-harness] Running {task_key} ({lm_task}, {num_fewshot}-shot, "
-              f"n={len(indices)}) …")
+              f"n={n_samples}) …")
 
         proc = subprocess.run(cmd, capture_output=False, text=True)
 
