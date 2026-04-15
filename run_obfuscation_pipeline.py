@@ -552,32 +552,51 @@ def run_pipeline(args):
                 artifact_dir=_undef_artifact_dir,
             )
 
-        # Write CSV row for the undefended baseline
+        # Write CSV row for the undefended baseline — use the same 42-column
+        # schema as defended runs so all_results.csv merges cleanly.
         if args.save_csv:
             import csv as _csv
-            row = {
-                "defense_type":        "none",
-                "projection_mode":     "none",
-                "epsilon":             0.0,
-                "num_calibration_prompts": 0,
+            _fieldnames = [
+                "model", "defense_type", "projection_mode", "num_layers", "per_layer_direction",
+                "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
+                "max_cos_sim", "avg_cos_sim",
+                "pca8_score_undefended", "pca8_score_defended",
+                "perlayer_score_undefended", "perlayer_score_defended",
+                "arditi_score_undefended", "arditi_score_defended",
+                "leace_score_undefended", "leace_score_defended",
+                "kl_harmful", "kl_harmless",
+                "harmbench_asr", "xstest_over_refusal_rate",
+                "gsm8k_exact_match", "math500_exact_match", "mmlu_acc",
+                "llamaguard_asr", "softopt_asr",
+                "gcg_score", "gcg_asr",
+                "autodan_score", "autodan_asr",
+                "cipherchat_best_asr", "cipherchat_best_cipher",
+                "pair_score", "pair_asr", "renellm_asr",
+            ]
+            row = {k: "" for k in _fieldnames}
+            row.update({
+                "model":           args.model_path,
+                "defense_type":    "none",
+                "projection_mode": "none",
+                "epsilon":         0.0,
+                "calibration_prompts": 0,
                 "per_layer_direction": False,
-                "undefended_refusal_score": undefended_refusal_mean,
-                "undefended_arditi_score":  undefended_abl["arditi_refusal_score"],
-                "undefended_pca_attack":    undefended_adaptive["pca"]["post_attack_refusal_score"],
-                "undefended_per_layer_attack": undefended_adaptive["per_layer"]["post_attack_refusal_score"],
-                "gcg_score":  _undef_gcg["post_attack_refusal_score"] if _undef_gcg else "",
-                "gcg_asr":    _undef_gcg["asr"] if _undef_gcg else "",
-                "autodan_score": _undef_autodan["post_attack_refusal_score"] if _undef_autodan else "",
-                "autodan_asr":   _undef_autodan["asr"] if _undef_autodan else "",
-                "cipherchat_best_asr":    _undef_cipher["best_asr"] if _undef_cipher else "",
+                "pca8_score_undefended":    f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
+                "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
+                "arditi_score_undefended":   f"{undefended_abl['arditi_refusal_score']:.4f}",
+                "gcg_score":  f"{_undef_gcg['post_attack_refusal_score']:.4f}" if _undef_gcg else "",
+                "gcg_asr":    f"{_undef_gcg['asr']:.4f}" if _undef_gcg else "",
+                "autodan_score": f"{_undef_autodan['post_attack_refusal_score']:.4f}" if _undef_autodan else "",
+                "autodan_asr":   f"{_undef_autodan['asr']:.4f}" if _undef_autodan else "",
+                "cipherchat_best_asr":    f"{_undef_cipher['best_asr']:.4f}" if _undef_cipher else "",
                 "cipherchat_best_cipher": _undef_cipher["best_cipher"] if _undef_cipher else "",
-                "pair_score": _undef_pair["post_attack_refusal_score"] if _undef_pair else "",
-                "pair_asr":   _undef_pair["asr"] if _undef_pair else "",
-                "renellm_asr": _undef_renellm["asr"] if _undef_renellm else "",
-            }
+                "pair_score": f"{_undef_pair['post_attack_refusal_score']:.4f}" if _undef_pair else "",
+                "pair_asr":   f"{_undef_pair['asr']:.4f}" if _undef_pair else "",
+                "renellm_asr": f"{_undef_renellm['asr']:.4f}" if _undef_renellm else "",
+            })
             file_exists = os.path.isfile(args.save_csv)
             with open(args.save_csv, "a", newline="") as f:
-                writer = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                writer = _csv.DictWriter(f, fieldnames=_fieldnames)
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(row)
@@ -802,16 +821,20 @@ def run_pipeline(args):
         print("Stage 4b: HarmBench ASR evaluation (Mazeika et al. 2024) …")
         print("=" * 60)
 
-        harmbench_result = evaluate_harmbench_asr(
-            model=model_base.model,
-            tokenize_fn=model_base.tokenize_instructions_fn,
-            fwd_pre_hooks=defense_fwd_pre_hooks,
-            fwd_hooks=defense_fwd_hooks,
-            behaviors_csv=args.harmbench_csv,
-            n_behaviors=args.harmbench_n,
-            seed=args.seed,
-            artifact_dir=obf_artifact_dir,
-        )
+        try:
+            harmbench_result = evaluate_harmbench_asr(
+                model=model_base.model,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                fwd_pre_hooks=defense_fwd_pre_hooks,
+                fwd_hooks=defense_fwd_hooks,
+                behaviors_csv=args.harmbench_csv,
+                n_behaviors=args.harmbench_n,
+                seed=args.seed,
+                artifact_dir=obf_artifact_dir,
+            )
+        except Exception as _e:
+            print(f"[WARN] HarmBench evaluation failed: {_e}")
+            harmbench_result = None
 
     # ==================================================================
     # Stage 4c: XSTest over-refusal evaluation (Röttger et al. 2023)
@@ -824,13 +847,17 @@ def run_pipeline(args):
         print("Stage 4c: XSTest over-refusal evaluation (Röttger et al. 2023) …")
         print("=" * 60)
 
-        xstest_result = evaluate_xstest(
-            model=model_base.model,
-            tokenize_fn=model_base.tokenize_instructions_fn,
-            fwd_pre_hooks=defense_fwd_pre_hooks,
-            fwd_hooks=defense_fwd_hooks,
-            artifact_dir=obf_artifact_dir,
-        )
+        try:
+            xstest_result = evaluate_xstest(
+                model=model_base.model,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                fwd_pre_hooks=defense_fwd_pre_hooks,
+                fwd_hooks=defense_fwd_hooks,
+                artifact_dir=obf_artifact_dir,
+            )
+        except Exception as _e:
+            print(f"[WARN] XSTest evaluation failed: {_e}")
+            xstest_result = None
 
     # ==================================================================
     # Stage 5b: Llama Guard evaluation  (NEW)
@@ -1121,19 +1148,26 @@ def run_pipeline(args):
         print("Stage 9: Utility benchmarks (lm-evaluation-harness) …")
         print("=" * 60)
 
-        if not os.path.isdir(defended_model_path):
-            print(f"[lm-harness] Defended model not found at {defended_model_path}; "
-                  f"saving now …")
-            model_base.model.save_pretrained(defended_model_path)
-            model_base.tokenizer.save_pretrained(defended_model_path)
+        # Always re-save: obf_artifact_dir is shared across runs (keyed by model
+        # alias only), so stale weights from a prior run must be overwritten.
+        import shutil as _shutil
+        if os.path.isdir(defended_model_path):
+            _shutil.rmtree(defended_model_path)
+        print(f"[lm-harness] Saving defended model to {defended_model_path} …")
+        model_base.model.save_pretrained(defended_model_path)
+        model_base.tokenizer.save_pretrained(defended_model_path)
 
-        lm_harness_result = run_lm_harness(
-            model_path=defended_model_path,
-            tasks=args.lm_harness_tasks.split(","),
-            n_samples=args.lm_harness_n,
-            output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-            seed=args.seed,
-        )
+        try:
+            lm_harness_result = run_lm_harness(
+                model_path=defended_model_path,
+                tasks=args.lm_harness_tasks.split(","),
+                n_samples=args.lm_harness_n,
+                output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
+                seed=args.seed,
+            )
+        except Exception as _e:
+            print(f"[WARN] lm-harness evaluation failed: {_e}")
+            lm_harness_result = None
 
     # ==================================================================
     # Summary
