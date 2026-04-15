@@ -34,7 +34,7 @@ _PYTHON = sys.executable
 # hf_dataset_args: (path, name, split) for size detection
 TASKS = {
     "gsm8k":   ("gsm8k",            8, ("openai/gsm8k",      "main",    "test")),
-    "math500": ("minerva_math500",   4, ("lighteval/MATH",    "all",     "test")),
+    "math500": ("hendrycks_math500", 4, ("HuggingFaceH4/MATH-500", "default", "test")),
     "mmlu":    ("mmlu",              5, ("hails/mmlu_no_train", None,    "test")),
 }
 
