@@ -1215,6 +1215,7 @@ def run_pipeline(args):
     print(f"  PCA-{args.pca_top_k} attack      : {undefended_adaptive['pca']['post_attack_refusal_score']:.4f} → {adaptive_result['pca']['post_attack_refusal_score']:.4f}")
     print(f"  Per-layer attack   : {undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f} → {adaptive_result['per_layer']['post_attack_refusal_score']:.4f}")
     print(f"  Max |cos_sim|      : {abl_result['max_cos_sim']:.4f}")
+    print(f"  Avg |cos_sim| (pertinent): {abl_result['mean_cos_sim']:.4f}")
 
     if leace_result:
         undef_leace = undefended_leace['post_attack_refusal_score'] if undefended_leace else float('nan')
