@@ -901,6 +901,7 @@ def run_pipeline(args):
         benign_prompts=harmless_val,
         original_direction=original_direction,
         refusal_toks=model_base.refusal_toks,
+        pertinent_layers=obf_result["pertinent_layers"],
     )
 
     # Serialise (drop tensors)

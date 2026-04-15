@@ -92,6 +92,7 @@ def evaluate_abliteration_resistance(
     original_direction: torch.Tensor,
     refusal_toks,
     batch_size: int = 128,
+    pertinent_layers: List[int] = None,
 ) -> Dict:
     """
     Full abliteration-resistance evaluation.
@@ -101,6 +102,9 @@ def evaluate_abliteration_resistance(
     original_direction : Tensor
         The refusal direction extracted from the **undefended** model
         (used for the cosine-similarity diagnostic).
+    pertinent_layers : list of int, optional
+        Layer indices where the defense was applied. If provided,
+        ``mean_cos_sim`` is computed only over these layers.
 
     Returns
     -------
@@ -178,10 +182,18 @@ def evaluate_abliteration_resistance(
     post_abl_mean = post_abl_scores.mean().item()
     print(f"  Arditi post-attack refusal score: {post_abl_mean:.4f}")
 
+    # mean_cos_sim over pertinent layers only (where defense was applied)
+    if pertinent_layers is not None and len(pertinent_layers) > 0:
+        pertinent_cos = cos_sims.abs()[pertinent_layers]
+        mean_cos = pertinent_cos.mean().item()
+        print(f"  mean (pertinent layers {pertinent_layers}) = {mean_cos:.4f}")
+    else:
+        mean_cos = cos_sims.abs().mean().item()
+
     return {
         "cos_similarities": cos_sims,
         "max_cos_sim": cos_sims.abs().max().item(),
-        "mean_cos_sim": cos_sims.abs().mean().item(),
+        "mean_cos_sim": mean_cos,
         "defended_direction": defended_direction.cpu(),
         "defended_magnitudes": defended_magnitudes,
         "baseline_refusal_score": baseline_mean,
