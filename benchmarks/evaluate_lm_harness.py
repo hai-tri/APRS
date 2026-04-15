@@ -133,11 +133,9 @@ def run_lm_harness(
 
         lm_task, num_fewshot, _ = TASKS[task_key]
 
-        # Build seeded sample indices and write to JSON file
+        # Build seeded sample indices as inline JSON string for --samples flag
         indices = _sample_indices(task_key, n_samples, seed)
-        samples_path = os.path.join(output_dir, f"{task_key}_samples.json")
-        with open(samples_path, "w") as f:
-            json.dump({lm_task: indices}, f)
+        samples_json = json.dumps({lm_task: indices})
         print(f"[lm-harness] {task_key}: sampled {len(indices)} examples "
               f"(seed={seed}, indices[0:5]={indices[:5]})")
 
@@ -153,7 +151,7 @@ def run_lm_harness(
             "--device", device,
             "--output_path", output_path,
             "--seed", str(seed),
-            "--samples", samples_path,
+            "--samples", samples_json,
             "--trust_remote_code",
             "--apply_chat_template",
         ]
