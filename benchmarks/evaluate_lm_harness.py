@@ -209,7 +209,8 @@ def _extract_metrics(task_key: str, raw: dict) -> dict:
     elif task_key == "math500":
         return {
             "exact_match": raw.get("exact_match,get-answer",
-                                   raw.get("exact_match", None)),
+                                   raw.get("exact_match,none",
+                                   raw.get("exact_match", None))),
         }
     elif task_key == "mmlu":
         return {
