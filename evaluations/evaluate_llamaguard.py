@@ -13,11 +13,22 @@ Or call from the pipeline via ``run_llamaguard_evaluation()``.
 
 import json
 import argparse
+import os
+import sys
 from typing import List, Dict, Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from device_utils import (
+    empty_cache as _dev_empty_cache,
+    load_model_for_device as _dev_load_model,
+    is_xla_available as _dev_is_xla,
+)
 
 
 DEFAULT_MODEL = "meta-llama/Llama-Guard-3-8B"
@@ -26,11 +37,20 @@ DEFAULT_MODEL = "meta-llama/Llama-Guard-3-8B"
 def load_llamaguard(model_id: str = DEFAULT_MODEL, device: str = "auto"):
     """Load Llama Guard model and tokenizer."""
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-    )
+    if _dev_is_xla() or device != "auto":
+        # On XLA, accelerate's device_map="auto" is not supported; load via
+        # device_utils which handles CPU→XLA transfer. For explicit non-"auto"
+        # device strings we also bypass device_map and load manually.
+        model = _dev_load_model(
+            AutoModelForCausalLM, model_id, torch_dtype=torch.bfloat16,
+            trust_remote_code=False,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+        )
     model.eval()
     return model, tokenizer
 
@@ -120,10 +140,7 @@ def run_llamaguard_evaluation(
     del tokenizer
     import gc
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    _dev_empty_cache()
 
     # Annotate completions
     for comp, cls in zip(completions, classifications):

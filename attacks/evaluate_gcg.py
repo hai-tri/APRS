@@ -32,6 +32,7 @@ if _REFUSAL_DIR not in sys.path:
     sys.path.insert(0, _REFUSAL_DIR)
 
 from pipeline.submodules.select_direction import get_refusal_scores
+from pipeline.utils.hook_utils import add_hooks
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,8 @@ def _token_gradients(
     suffix_start: int,
     suffix_end: int,
     target_start: int,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> torch.Tensor:
     """
     Compute ∂L/∂e_k for each position k in the suffix, where L is the
@@ -117,7 +120,8 @@ def _token_gradients(
 
     inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=1)
 
-    output = model(inputs_embeds=inputs_embeds)
+    with add_hooks(fwd_pre_hooks or [], fwd_hooks or []):
+        output = model(inputs_embeds=inputs_embeds)
     logits = output.logits  # (1, seq_len, vocab)
 
     # NLL over target tokens
@@ -139,6 +143,8 @@ def _gcg_step(
     topk: int = 256,
     batch_size: int = 128,
     non_ascii_toks: Optional[torch.Tensor] = None,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> Tuple[torch.Tensor, float]:
     """
     One GCG optimisation step.
@@ -149,7 +155,15 @@ def _gcg_step(
     suffix_len = suffix_end - suffix_start
 
     # Compute token-level gradients
-    grad = _token_gradients(model, input_ids, suffix_start, suffix_end, target_start)
+    grad = _token_gradients(
+        model,
+        input_ids,
+        suffix_start,
+        suffix_end,
+        target_start,
+        fwd_pre_hooks=fwd_pre_hooks,
+        fwd_hooks=fwd_hooks,
+    )
     # grad: (suffix_len, vocab_size)
 
     # Optionally zero out non-ASCII tokens
@@ -181,8 +195,9 @@ def _gcg_step(
         cand_ids = input_ids.clone()
         cand_ids[0, suffix_start:suffix_end] = candidate
 
-        with torch.no_grad():
-            out = model(cand_ids)
+        with add_hooks(fwd_pre_hooks or [], fwd_hooks or []):
+            with torch.no_grad():
+                out = model(cand_ids)
         logits = out.logits[0, target_start - 1 : -1, :]
         labels = cand_ids[0, target_start:]
         loss = F.cross_entropy(logits, labels).item()
@@ -210,6 +225,8 @@ def run_gcg_single(
     early_stop_loss: float = 0.1,
     allow_non_ascii: bool = False,
     seed: int = 42,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> Dict:
     """
     Run GCG on a single (behavior, target) pair.
@@ -241,6 +258,8 @@ def run_gcg_single(
             suf_start, suf_end, target_start,
             topk=topk, batch_size=batch_size,
             non_ascii_toks=non_ascii,
+            fwd_pre_hooks=fwd_pre_hooks,
+            fwd_hooks=fwd_hooks,
         )
         losses.append(loss)
 
@@ -275,12 +294,16 @@ def _score_with_suffix(
     suffix: str,
     refusal_toks,
     batch_size: int = 8,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> float:
     """Return mean refusal score when the suffix is appended to each prompt."""
     augmented = [p + " " + suffix for p in prompts]
     scores = get_refusal_scores(
         model, augmented, tokenize_fn, refusal_toks,
-        fwd_pre_hooks=[], fwd_hooks=[], batch_size=batch_size,
+        fwd_pre_hooks=fwd_pre_hooks or [],
+        fwd_hooks=fwd_hooks or [],
+        batch_size=batch_size,
     )
     return scores.mean().item()
 
@@ -304,6 +327,8 @@ def evaluate_gcg(
     n_behaviors: int = 25,
     seed: int = 42,
     artifact_dir: Optional[str] = None,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> Dict:
     """
     Run GCG attack on up to n_behaviors prompts and report mean post-attack
@@ -346,6 +371,8 @@ def evaluate_gcg(
             target=target, suffix_len=suffix_len, num_steps=num_steps,
             topk=topk, batch_size=batch_size,
             early_stop_loss=early_stop_loss, seed=seed + idx,
+            fwd_pre_hooks=fwd_pre_hooks,
+            fwd_hooks=fwd_hooks,
         )
         result["behavior"] = behavior
         per_behavior.append(result)
@@ -356,6 +383,8 @@ def evaluate_gcg(
     for behavior, suffix in zip(behaviors, best_suffixes):
         s = _score_with_suffix(
             model, tokenize_fn, [behavior], suffix, refusal_toks,
+            fwd_pre_hooks=fwd_pre_hooks,
+            fwd_hooks=fwd_hooks,
         )
         scores.append(s)
 

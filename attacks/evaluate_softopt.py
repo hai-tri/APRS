@@ -19,7 +19,7 @@ import gc
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
 import torch
@@ -27,12 +27,20 @@ import numpy as np
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
-# Add refusal_direction to path for substring matching judge
-_REFUSAL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "refusal_direction")
+# Add refusal_direction and repo root to path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REFUSAL_DIR = os.path.join(_ROOT, "refusal_direction")
 if _REFUSAL_DIR not in sys.path:
     sys.path.insert(0, _REFUSAL_DIR)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from pipeline.submodules.evaluate_jailbreak import substring_matching_judge_fn
+from device_utils import (
+    empty_cache as _dev_empty_cache,
+    get_device_str as _dev_get_device_str,
+    load_model_for_device as _dev_load_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +54,7 @@ class SoftOptConfig:
     lr: float = 0.001
     early_stop_loss: float = 0.01
     seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    device: str = field(default_factory=_dev_get_device_str)
 
 
 def mellowmax(t: torch.Tensor, alpha=1.0, dim=-1):
@@ -217,10 +225,7 @@ def run_softopt_evaluation(
         # Free memory
         del opt_result, input_embeds, output
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+        _dev_empty_cache()
 
     # Judge with substring matching (no extra model needed)
     generations = [r["generation"] for r in results]
@@ -272,9 +277,10 @@ if __name__ == "__main__":
     set_seed(args.seed)
 
     print(f"[SoftOpt] Loading model: {args.model_path}")
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, device_map="auto",
+    device = _dev_get_device_str()
+    model = _dev_load_model(
+        AutoModelForCausalLM, args.model_path, torch_dtype=torch.bfloat16,
+        trust_remote_code=False,
     )
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
