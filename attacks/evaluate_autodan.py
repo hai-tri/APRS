@@ -34,6 +34,7 @@ if _REFUSAL_DIR not in sys.path:
     sys.path.insert(0, _REFUSAL_DIR)
 
 from pipeline.submodules.select_direction import get_refusal_scores
+from pipeline.utils.hook_utils import add_hooks
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +112,8 @@ def _compute_fitness(
     prompts: List[str],
     target: str,
     device: str,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> List[float]:
     """Return list of loss values (lower = better jailbreak = higher fitness)."""
     model.eval()
@@ -130,8 +133,9 @@ def _compute_fitness(
                                       return_tensors="pt")[0].to(device)
         input_ids = torch.cat([prefix_ids, target_ids]).unsqueeze(0)
 
-        with torch.no_grad():
-            out = model(input_ids)
+        with add_hooks(fwd_pre_hooks or [], fwd_hooks or []):
+            with torch.no_grad():
+                out = model(input_ids)
         logits = out.logits[0]
         target_start = len(prefix_ids)
         shift_logits = logits[target_start - 1 : -1]
@@ -214,6 +218,8 @@ def run_autodan_single(
     elite_ratio: float = 0.1,
     early_stop_loss: float = 0.5,
     seed: int = 42,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> Dict:
     """
     Run AutoDAN-GA on a single behavior string.
@@ -229,7 +235,10 @@ def run_autodan_single(
         tmpl = random.choice(_SEED_TEMPLATES)
         population.append(tmpl.format(behavior=behavior))
 
-    losses = _compute_fitness(model, tokenizer, population, target, device)
+    losses = _compute_fitness(
+        model, tokenizer, population, target, device,
+        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
+    )
     n_elite = max(1, int(population_size * elite_ratio))
 
     best_loss = min(losses)
@@ -254,7 +263,10 @@ def run_autodan_single(
             offspring.append(child)
 
         population = offspring[:population_size]
-        losses = _compute_fitness(model, tokenizer, population, target, device)
+        losses = _compute_fitness(
+            model, tokenizer, population, target, device,
+            fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
+        )
 
         step_best_loss = min(losses)
         if step_best_loss < best_loss:
@@ -297,6 +309,8 @@ def evaluate_autodan(
     n_behaviors: int = 25,
     seed: int = 42,
     artifact_dir: Optional[str] = None,
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
 ) -> Dict:
     """
     Run AutoDAN-GA across n_behaviors harmful prompts.
@@ -337,6 +351,8 @@ def evaluate_autodan(
             num_steps=num_steps, crossover_rate=crossover_rate,
             mutation_rate=mutation_rate, early_stop_loss=early_stop_loss,
             seed=seed + idx,
+            fwd_pre_hooks=fwd_pre_hooks,
+            fwd_hooks=fwd_hooks,
         )
         result["behavior"] = behavior
         per_behavior.append(result)
@@ -346,7 +362,8 @@ def evaluate_autodan(
     for r in per_behavior:
         s = get_refusal_scores(
             model, [r["best_prompt"]], tokenize_fn, refusal_toks,
-            fwd_pre_hooks=[], fwd_hooks=[],
+            fwd_pre_hooks=fwd_pre_hooks or [],
+            fwd_hooks=fwd_hooks or [],
         )
         scores.append(s.mean().item())
 

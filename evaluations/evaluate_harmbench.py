@@ -20,10 +20,121 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _REFUSAL_DIR = os.path.join(_ROOT, "refusal_direction")
 if _REFUSAL_DIR not in sys.path:
     sys.path.insert(0, _REFUSAL_DIR)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from pipeline.submodules.evaluate_jailbreak import harmbench_judge_fn, load_harmbench_behaviors
+from device_utils import empty_cache as _dev_empty_cache
 
 _DEFAULT_CSV = os.path.join(_ROOT, "data", "harmbench_behaviors_text_test.csv")
+
+
+def generate_responses_for_prompts(
+    model,
+    tokenize_fn,
+    prompts: List[str],
+    fwd_pre_hooks: Optional[list] = None,
+    fwd_hooks: Optional[list] = None,
+    max_new_tokens: int = 256,
+    batch_size: int = 4,
+) -> List[str]:
+    """Generate deterministic responses for prompts under optional hooks."""
+    from pipeline.utils.hook_utils import add_hooks
+
+    if fwd_pre_hooks is None:
+        fwd_pre_hooks = []
+    if fwd_hooks is None:
+        fwd_hooks = []
+
+    device = next(model.parameters()).device
+    responses: List[str] = []
+    model.eval()
+
+    with add_hooks(fwd_pre_hooks, fwd_hooks):
+        for i in range(0, len(prompts), batch_size):
+            batch = prompts[i : i + batch_size]
+            inputs = tokenize_fn(instructions=batch)
+            input_ids = inputs.input_ids.to(device)
+            attention_mask = inputs.attention_mask.to(device)
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=input_ids[0, -1].item(),
+                )
+
+            for out in output_ids:
+                prompt_len = input_ids.shape[1]
+                new_tokens = out[prompt_len:]
+                responses.append(_decode(model, new_tokens))
+
+            print(f"[HarmBench] Generated {min(i + batch_size, len(prompts))}/{len(prompts)}")
+
+    return responses
+
+
+def score_harmbench_responses(
+    prompts: List[str],
+    responses: List[str],
+    classifier_model_id: str = "cais/HarmBench-Llama-2-13b-cls",
+    artifact_path: Optional[str] = None,
+    metadata: Optional[List[Dict]] = None,
+) -> Dict:
+    """Score existing prompt/response pairs with the HarmBench classifier."""
+    if len(prompts) != len(responses):
+        raise ValueError(
+            f"Expected prompts and responses to have the same length, got "
+            f"{len(prompts)} and {len(responses)}"
+        )
+
+    if not prompts:
+        result = {
+            "asr": 0.0,
+            "n_harmful": 0,
+            "n_total": 0,
+            "completions": [],
+        }
+        if artifact_path:
+            os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+            with open(artifact_path, "w") as f:
+                json.dump(result, f, indent=4)
+        return result
+
+    print("[HarmBench] Running HarmBench classifier …")
+    classifications = harmbench_judge_fn(
+        prompts=prompts,
+        responses=responses,
+        classifier_model_id=classifier_model_id,
+    )
+
+    completions = []
+    for idx, (prompt, response, is_harmful) in enumerate(zip(prompts, responses, classifications)):
+        entry = {
+            "behavior": prompt,
+            "response": response,
+            "is_harmful": is_harmful,
+        }
+        if metadata is not None and idx < len(metadata) and metadata[idx] is not None:
+            entry.update(metadata[idx])
+        completions.append(entry)
+
+    result = {
+        "asr": sum(classifications) / len(classifications),
+        "n_harmful": sum(classifications),
+        "n_total": len(classifications),
+        "completions": completions,
+    }
+
+    if artifact_path:
+        os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+        with open(artifact_path, "w") as f:
+            json.dump(result, f, indent=4)
+        print(f"[HarmBench] Results saved to {artifact_path}")
+
+    return result
 
 
 def evaluate_harmbench_asr(
@@ -63,10 +174,6 @@ def evaluate_harmbench_asr(
         ``completions``     — list of {behavior, behavior_id, response, is_harmful}
         ``per_category_asr``— ASR broken down by SemanticCategory
     """
-    from pipeline.utils.hook_utils import add_hooks
-
-    device = next(model.parameters()).device
-
     # ----------------------------------------------------------------
     # Step 1: Load behaviors
     # ----------------------------------------------------------------
@@ -78,34 +185,15 @@ def evaluate_harmbench_asr(
     # Step 2: Generate completions
     # ----------------------------------------------------------------
     print(f"[HarmBench] Generating completions ({len(prompts)} prompts) …")
-    responses = []
-    model.eval()
-
-    with add_hooks(fwd_pre_hooks, fwd_hooks):
-        for i in range(0, len(prompts), batch_size):
-            batch = prompts[i : i + batch_size]
-            inputs = tokenize_fn(instructions=batch)
-            input_ids = inputs.input_ids.to(device)
-            attention_mask = inputs.attention_mask.to(device)
-
-            with torch.no_grad():
-                output_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=input_ids[0, -1].item(),
-                )
-
-            # Decode only the newly generated tokens
-            for j, out in enumerate(output_ids):
-                prompt_len = input_ids.shape[1]
-                new_tokens = out[prompt_len:]
-                # get tokenizer from tokenize_fn's closure — fall back to model's config
-                response_text = _decode(model, new_tokens)
-                responses.append(response_text)
-
-            print(f"[HarmBench] Generated {min(i + batch_size, len(prompts))}/{len(prompts)}")
+    responses = generate_responses_for_prompts(
+        model=model,
+        tokenize_fn=tokenize_fn,
+        prompts=prompts,
+        fwd_pre_hooks=fwd_pre_hooks,
+        fwd_hooks=fwd_hooks,
+        max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+    )
 
     # ----------------------------------------------------------------
     # Step 3: Offload target model to free memory for classifier
@@ -113,61 +201,43 @@ def evaluate_harmbench_asr(
     print("[HarmBench] Offloading target model before running classifier …")
     original_device = next(model.parameters()).device
     model.to("cpu")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    _dev_empty_cache()
 
     # ----------------------------------------------------------------
     # Step 4: Classify
     # ----------------------------------------------------------------
-    print("[HarmBench] Running HarmBench classifier …")
-    classifications = harmbench_judge_fn(
-        prompts=prompts,
-        responses=responses,
-        classifier_model_id=classifier_model_id,
-    )
-
-    # Restore target model
-    model.to(original_device)
-
-    # ----------------------------------------------------------------
-    # Step 5: Aggregate
-    # ----------------------------------------------------------------
-    completions = []
-    for b, response, is_harmful in zip(behaviors, responses, classifications):
-        completions.append({
-            "behavior": b["behavior"],
-            "behavior_id": b["behavior_id"],
-            "semantic_category": b["semantic_category"],
-            "response": response,
-            "is_harmful": is_harmful,
-        })
-
-    asr = sum(classifications) / len(classifications)
+    try:
+        artifact_path = None
+        if artifact_dir:
+            artifact_path = os.path.join(artifact_dir, "harmbench_evaluation.json")
+        result = score_harmbench_responses(
+            prompts=prompts,
+            responses=responses,
+            classifier_model_id=classifier_model_id,
+            artifact_path=artifact_path,
+            metadata=[
+                {
+                    "behavior_id": b["behavior_id"],
+                    "semantic_category": b["semantic_category"],
+                }
+                for b in behaviors
+            ],
+        )
+    finally:
+        model.to(original_device)
 
     per_category = {}
-    for c in completions:
-        cat = c["semantic_category"] or "unknown"
+    for c in result["completions"]:
+        cat = c.get("semantic_category") or "unknown"
         per_category.setdefault(cat, []).append(c["is_harmful"])
-    per_category_asr = {cat: sum(vals) / len(vals) for cat, vals in per_category.items()}
-
-    print(f"[HarmBench] ASR: {asr:.4f} ({sum(classifications)}/{len(classifications)})")
-
-    result = {
-        "asr": asr,
-        "n_harmful": sum(classifications),
-        "n_total": len(classifications),
-        "completions": completions,
-        "per_category_asr": per_category_asr,
-    }
+    result["per_category_asr"] = {cat: sum(vals) / len(vals) for cat, vals in per_category.items()}
 
     if artifact_dir:
-        os.makedirs(artifact_dir, exist_ok=True)
-        with open(os.path.join(artifact_dir, "harmbench_evaluation.json"), "w") as f:
+        artifact_path = os.path.join(artifact_dir, "harmbench_evaluation.json")
+        with open(artifact_path, "w") as f:
             json.dump(result, f, indent=4)
-        print(f"[HarmBench] Results saved to {artifact_dir}/harmbench_evaluation.json")
 
+    print(f"[HarmBench] ASR: {result['asr']:.4f} ({result['n_harmful']}/{result['n_total']})")
     return result
 
 

@@ -44,6 +44,7 @@ from pipeline.utils.hook_utils import (
 
 from obfuscation_config import ObfuscationConfig
 from obfuscation_utils import ModelComponents
+from device_utils import empty_cache as _dev_empty_cache
 from apply_obfuscation import apply_obfuscation
 from defenses.apply_surgical import apply_surgical
 from defenses.apply_cast import apply_cast
@@ -65,7 +66,7 @@ def parse_arguments():
 
     # Defense selection
     parser.add_argument("--defense_type", type=str, default="obfuscation",
-                        choices=["obfuscation", "surgical", "cast", "circuit_breakers"],
+                        choices=["obfuscation", "surgical", "cast", "circuit_breakers", "alphasteer"],
                         help="Defense mechanism to evaluate (default: obfuscation)")
     # Surgical hyperparameters
     parser.add_argument("--surgical_ablation_coeff", type=float, default=1.0,
@@ -90,6 +91,13 @@ def parse_arguments():
                         help="Circuit Breakers peak RR loss coefficient (default: 1.0)")
     parser.add_argument("--cb_retain_coeff_max", type=float, default=1.0,
                         help="Circuit Breakers peak retention loss coefficient (default: 1.0)")
+    # AlphaSteer hyperparameters
+    parser.add_argument("--alphasteer_strength", type=float, default=0.4,
+                        help="AlphaSteer steering strength (default: 0.4)")
+    parser.add_argument("--alphasteer_null_ratio", type=float, default=0.5,
+                        help="AlphaSteer null-space ratio (default: 0.5)")
+    parser.add_argument("--alphasteer_lambda", type=float, default=10.0,
+                        help="AlphaSteer regularisation coefficient (default: 10.0)")
 
     # Obfuscation hyperparameters
     parser.add_argument("--epsilon", type=float, default=0.1,
@@ -211,6 +219,64 @@ def parse_arguments():
 
 
 SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def _generate_harmbench_for_attack(
+    *,
+    label: str,
+    model,
+    tokenize_fn,
+    behaviors,
+    attacked_prompts=None,
+    responses=None,
+    fwd_pre_hooks=None,
+    fwd_hooks=None,
+    max_new_tokens=256,
+    classifier_model_id="cais/HarmBench-Llama-2-13b-cls",
+    artifact_dir=None,
+):
+    from evaluations.evaluate_harmbench import (
+        generate_responses_for_prompts,
+        score_harmbench_responses,
+    )
+
+    if not behaviors:
+        return None
+
+    if responses is None:
+        if attacked_prompts is None:
+            raise ValueError(f"{label}: expected attacked prompts or responses")
+        responses = generate_responses_for_prompts(
+            model=model,
+            tokenize_fn=tokenize_fn,
+            prompts=attacked_prompts,
+            fwd_pre_hooks=fwd_pre_hooks or [],
+            fwd_hooks=fwd_hooks or [],
+            max_new_tokens=max_new_tokens,
+            batch_size=4,
+        )
+
+    metadata = None
+    if attacked_prompts is not None:
+        metadata = [{"attacked_prompt": prompt} for prompt in attacked_prompts]
+
+    artifact_path = None
+    if artifact_dir is not None:
+        artifact_path = os.path.join(artifact_dir, f"harmbench_post_{label}.json")
+
+    _device = next(model.parameters()).device
+    model.to("cpu")
+    _dev_empty_cache()
+    try:
+        return score_harmbench_responses(
+            prompts=behaviors,
+            responses=responses,
+            classifier_model_id=classifier_model_id,
+            artifact_path=artifact_path,
+            metadata=metadata,
+        )
+    finally:
+        model.to(_device)
 
 
 def load_mlabonne_datasets(n_train=128, n_val=32, seed=42):
@@ -569,7 +635,17 @@ def run_pipeline(args):
                 "arditi_score_undefended", "arditi_score_defended",
                 "leace_score_undefended", "leace_score_defended",
                 "kl_harmful", "kl_harmless",
-                "harmbench_asr", "xstest_over_refusal_rate",
+                "harmbench_asr",
+                "harmbench_asr_pre_attack",
+                "harmbench_asr_post_gcg",
+                "harmbench_asr_post_autodan",
+                "harmbench_asr_post_cipherchat",
+                "harmbench_asr_post_pair",
+                "harmbench_asr_post_renellm",
+                "xstest_over_refusal_rate",
+                "gsm8k_exact_match_undefended",
+                "math500_exact_match_undefended",
+                "mmlu_acc_undefended",
                 "gsm8k_exact_match", "math500_exact_match", "mmlu_acc",
                 "llamaguard_asr", "softopt_asr",
                 "gcg_score", "gcg_asr",
@@ -607,6 +683,32 @@ def run_pipeline(args):
 
         print("\n--undefended_only: Done.")
         return
+
+    # ==================================================================
+    # Stage 2c: Pre-defense utility benchmarks
+    # ==================================================================
+    lm_harness_undefended = None
+    if not args.skip_lm_harness:
+        from benchmarks.evaluate_lm_harness import run_lm_harness
+        print("=" * 60)
+        print("Stage 2c: Pre-defense utility benchmarks (lm-evaluation-harness) …")
+        print("=" * 60)
+        try:
+            _undef_lm_dir = os.path.join(obf_artifact_dir, "lm_harness_undefended")
+            lm_harness_undefended = run_lm_harness(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                fwd_pre_hooks=[],
+                fwd_hooks=[],
+                tasks=args.lm_harness_tasks.split(","),
+                n_samples=args.lm_harness_n,
+                output_dir=_undef_lm_dir,
+                batch_size=4,
+                seed=args.seed,
+            )
+        except Exception as _e:
+            print(f"[lm-harness undefended] WARNING: {_e}")
+            lm_harness_undefended = None
 
     # ==================================================================
     # Stage 3: Apply defense
@@ -697,6 +799,33 @@ def run_pipeline(args):
             "undefended_refusal_score": undefended_refusal_mean,
         }
 
+    elif args.defense_type == "alphasteer":
+        from defenses.apply_alphasteer import apply_alphasteer
+        as_result = apply_alphasteer(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            harmful_prompts=harmful_train,
+            harmless_prompts=harmless_train,
+            refusal_direction=direction,
+            mean_diffs=mean_diffs,
+            strength=args.alphasteer_strength,
+            null_ratio=args.alphasteer_null_ratio,
+            lambda_reg=args.alphasteer_lambda,
+            batch_size=16,
+            artifact_dir=obf_artifact_dir,
+        )
+        defense_fwd_pre_hooks = as_result["fwd_pre_hooks"]
+        defense_fwd_hooks     = as_result["fwd_hooks"]
+        obf_result = {
+            "pertinent_layers": as_result["target_layers"],
+            "z_sum_norm": 0.0,
+            "num_writers_patched": 0,
+            "num_readers_patched": 0,
+            "undefended_refusal_score": undefended_refusal_mean,
+        }
+
     elif args.defense_type == "circuit_breakers":
         cb_result = apply_circuit_breakers(
             model=model_base.model,
@@ -760,7 +889,13 @@ def run_pipeline(args):
     # Stage 4–5: Completions and loss evaluation (existing)
     # ==================================================================
     if not args.skip_evaluations:
-        from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
+        try:
+            from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
+        except (ImportError, ModuleNotFoundError) as _vllm_err:
+            print(f"[Stage 4] WARNING: could not import evaluate_jailbreak ({_vllm_err}). "
+                  f"Skipping jailbreak scoring (vllm unavailable). "
+                  f"HarmBench and XSTest evaluations are unaffected.")
+            evaluate_jailbreak = None
 
         print("=" * 60)
         print("Stage 4: Evaluating completions (defended model) …")
@@ -769,24 +904,29 @@ def run_pipeline(args):
         completions_dir = os.path.join(obf_artifact_dir, "completions")
         os.makedirs(completions_dir, exist_ok=True)
 
-        # Defended model — no hooks needed (defense is baked into weights)
         for dataset_name in cfg.evaluation_datasets:
             dataset = load_dataset(dataset_name)
             completions = model_base.generate_completions(
-                dataset, fwd_pre_hooks=[], fwd_hooks=[],
+                dataset,
+                fwd_pre_hooks=defense_fwd_pre_hooks,
+                fwd_hooks=defense_fwd_hooks,
                 max_new_tokens=cfg.max_new_tokens,
             )
             out_path = os.path.join(completions_dir, f"{dataset_name}_defended_completions.json")
             with open(out_path, "w") as f:
                 json.dump(completions, f, indent=4)
 
-            evaluation = evaluate_jailbreak(
-                completions=completions,
-                methodologies=cfg.jailbreak_eval_methodologies,
-                evaluation_path=os.path.join(completions_dir, f"{dataset_name}_defended_evaluations.json"),
-            )
-            with open(os.path.join(completions_dir, f"{dataset_name}_defended_evaluations.json"), "w") as f:
-                json.dump(evaluation, f, indent=4)
+            if evaluate_jailbreak is not None:
+                try:
+                    evaluation = evaluate_jailbreak(
+                        completions=completions,
+                        methodologies=cfg.jailbreak_eval_methodologies,
+                        evaluation_path=os.path.join(completions_dir, f"{dataset_name}_defended_evaluations.json"),
+                    )
+                    with open(os.path.join(completions_dir, f"{dataset_name}_defended_evaluations.json"), "w") as f:
+                        json.dump(evaluation, f, indent=4)
+                except Exception as _eval_err:
+                    print(f"[Stage 4] WARNING: evaluate_jailbreak failed ({_eval_err}). Skipping.")
 
         print("=" * 60)
         print("Stage 5: Evaluating loss (defended model) …")
@@ -799,7 +939,9 @@ def run_pipeline(args):
         # Use harmless_val as test prompts (already loaded from mlabonne)
         harmless_test = [{"instruction": p, "category": None} for p in harmless_val[:cfg.n_test]]
         harmless_completions = model_base.generate_completions(
-            harmless_test, fwd_pre_hooks=[], fwd_hooks=[],
+            harmless_test,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             max_new_tokens=cfg.max_new_tokens,
         )
         harmless_comp_path = os.path.join(completions_dir, "harmless_defended_completions.json")
@@ -807,7 +949,9 @@ def run_pipeline(args):
             json.dump(harmless_completions, f, indent=4)
 
         loss_evals = evaluate_loss(
-            model_base, fwd_pre_hooks=[], fwd_hooks=[],
+            model_base,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             batch_size=cfg.ce_loss_batch_size, n_batches=cfg.ce_loss_n_batches,
             completions_file_path=harmless_comp_path,
         )
@@ -994,6 +1138,8 @@ def run_pipeline(args):
             n_behaviors=args.gcg_n_behaviors,
             seed=args.seed,
             artifact_dir=obf_artifact_dir,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
         )
 
     # ==================================================================
@@ -1018,6 +1164,8 @@ def run_pipeline(args):
             n_behaviors=args.autodan_n_behaviors,
             seed=args.seed,
             artifact_dir=obf_artifact_dir,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
         )
 
     # ==================================================================
@@ -1035,6 +1183,8 @@ def run_pipeline(args):
             model=model_base.model,
             tokenizer=model_base.tokenizer,
             harmful_prompts=harmful_val,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             ciphers=args.cipherchat_ciphers.split(","),
             artifact_dir=obf_artifact_dir,
         )
@@ -1056,6 +1206,8 @@ def run_pipeline(args):
             tokenize_fn=model_base.tokenize_instructions_fn,
             harmful_prompts=harmful_val,
             refusal_toks=model_base.refusal_toks,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             n_streams=args.pair_streams,
             n_iterations=args.pair_iterations,
             n_behaviors=args.pair_n_behaviors,
@@ -1079,6 +1231,8 @@ def run_pipeline(args):
             model=model_base.model,
             tokenizer=model_base.tokenizer,
             harmful_prompts=harmful_val,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
             n_rewrite_strategies=args.renellm_strategies,
             n_scenario_attempts=args.renellm_attempts,
             seed=args.seed,
@@ -1111,11 +1265,97 @@ def run_pipeline(args):
             limit=args.softopt_limit,
         )
 
+    harmbench_post_attack_results = {}
+    if not args.skip_harmbench:
+        print("=" * 60)
+        print("Stage 7i: HarmBench ASR on post-attack outputs …")
+        print("=" * 60)
+
+        try:
+            if gcg_result:
+                gcg_behaviors = [r["behavior"] for r in gcg_result["per_behavior"]]
+                gcg_prompts = [f"{r['behavior']} {r['suffix_str']}".strip() for r in gcg_result["per_behavior"]]
+                harmbench_post_attack_results["gcg"] = _generate_harmbench_for_attack(
+                    label="gcg",
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    behaviors=gcg_behaviors,
+                    attacked_prompts=gcg_prompts,
+                    fwd_pre_hooks=defense_fwd_pre_hooks,
+                    fwd_hooks=defense_fwd_hooks,
+                    max_new_tokens=cfg.max_new_tokens,
+                    artifact_dir=obf_artifact_dir,
+                )
+            if autodan_result:
+                autodan_behaviors = [r["behavior"] for r in autodan_result["per_behavior"]]
+                autodan_prompts = [r["best_prompt"] for r in autodan_result["per_behavior"]]
+                harmbench_post_attack_results["autodan"] = _generate_harmbench_for_attack(
+                    label="autodan",
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    behaviors=autodan_behaviors,
+                    attacked_prompts=autodan_prompts,
+                    fwd_pre_hooks=defense_fwd_pre_hooks,
+                    fwd_hooks=defense_fwd_hooks,
+                    max_new_tokens=cfg.max_new_tokens,
+                    artifact_dir=obf_artifact_dir,
+                )
+            if cipherchat_result and cipherchat_result.get("best_cipher"):
+                cipher_entries = cipherchat_result["per_cipher"][cipherchat_result["best_cipher"]]["completions"]
+                harmbench_post_attack_results["cipherchat"] = _generate_harmbench_for_attack(
+                    label="cipherchat",
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    behaviors=[c["original_prompt"] for c in cipher_entries],
+                    attacked_prompts=[c["encoded_prompt"] for c in cipher_entries],
+                    responses=[c["response"] for c in cipher_entries],
+                    artifact_dir=obf_artifact_dir,
+                )
+            if pair_result:
+                pair_behaviors = [r["behavior"] for r in pair_result["per_behavior"]]
+                pair_prompts = [r["best_prompt"] for r in pair_result["per_behavior"]]
+                harmbench_post_attack_results["pair"] = _generate_harmbench_for_attack(
+                    label="pair",
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    behaviors=pair_behaviors,
+                    attacked_prompts=pair_prompts,
+                    fwd_pre_hooks=defense_fwd_pre_hooks,
+                    fwd_hooks=defense_fwd_hooks,
+                    max_new_tokens=cfg.max_new_tokens,
+                    artifact_dir=obf_artifact_dir,
+                )
+            if renellm_result:
+                renellm_behaviors = []
+                renellm_prompts = []
+                renellm_responses = []
+                for result in renellm_result["per_prompt"]:
+                    attempts = result.get("attempts", [])
+                    if not attempts:
+                        continue
+                    chosen = next((a for a in attempts if not a["is_refusal"]), attempts[-1])
+                    renellm_behaviors.append(result["behavior"])
+                    renellm_prompts.append(chosen["nested_prompt"])
+                    renellm_responses.append(chosen["response"])
+                harmbench_post_attack_results["renellm"] = _generate_harmbench_for_attack(
+                    label="renellm",
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    behaviors=renellm_behaviors,
+                    attacked_prompts=renellm_prompts,
+                    responses=renellm_responses,
+                    artifact_dir=obf_artifact_dir,
+                )
+        except Exception as _e:
+            print(f"[WARN] Post-attack HarmBench evaluation failed: {_e}")
+            harmbench_post_attack_results = {}
+
     # ==================================================================
     # Stage 8: Heretic attack  (NEW)
     # ==================================================================
     heretic_result = None
     defended_model_path = os.path.join(obf_artifact_dir, "defended_model")
+    has_inference_hooks = bool(defense_fwd_pre_hooks or defense_fwd_hooks)
 
     if not args.skip_heretic:
         from attacks.evaluate_heretic_attack import run_heretic_attack
@@ -1124,23 +1364,26 @@ def run_pipeline(args):
         print("Stage 8: Saving defended model for Heretic attack …")
         print("=" * 60)
 
-        model_base.model.save_pretrained(defended_model_path)
-        model_base.tokenizer.save_pretrained(defended_model_path)
-        print(f"  Saved to: {defended_model_path}")
+        if has_inference_hooks:
+            print("[WARN] Skipping Heretic for hook-based defenses; saved weights do not encode runtime hooks.")
+        else:
+            model_base.model.save_pretrained(defended_model_path)
+            model_base.tokenizer.save_pretrained(defended_model_path)
+            print(f"  Saved to: {defended_model_path}")
 
-        print("=" * 60)
-        print(f"Stage 8: Running Heretic attack ({args.heretic_trials} trials) …")
-        print("=" * 60)
+            print("=" * 60)
+            print(f"Stage 8: Running Heretic attack ({args.heretic_trials} trials) …")
+            print("=" * 60)
 
-        heretic_result = run_heretic_attack(
-            defended_model_path=defended_model_path,
-            artifact_dir=obf_artifact_dir,
-            n_trials=args.heretic_trials,
-            system_prompt=SYSTEM_PROMPT,
-        )
+            heretic_result = run_heretic_attack(
+                defended_model_path=defended_model_path,
+                artifact_dir=obf_artifact_dir,
+                n_trials=args.heretic_trials,
+                system_prompt=SYSTEM_PROMPT,
+            )
 
-        with open(os.path.join(obf_artifact_dir, "heretic_attack.json"), "w") as f:
-            json.dump(heretic_result, f, indent=4)
+            with open(os.path.join(obf_artifact_dir, "heretic_attack.json"), "w") as f:
+                json.dump(heretic_result, f, indent=4)
 
     # ==================================================================
     # Stage 9: Utility benchmarks — GSM8k, MATH500, MMLU (lm-eval-harness)
@@ -1153,21 +1396,25 @@ def run_pipeline(args):
         print("Stage 9: Utility benchmarks (lm-evaluation-harness) …")
         print("=" * 60)
 
-        # Always re-save: obf_artifact_dir is shared across runs (keyed by model
-        # alias only), so stale weights from a prior run must be overwritten.
-        import shutil as _shutil
-        if os.path.isdir(defended_model_path):
-            _shutil.rmtree(defended_model_path)
-        print(f"[lm-harness] Saving defended model to {defended_model_path} …")
-        model_base.model.save_pretrained(defended_model_path)
-        model_base.tokenizer.save_pretrained(defended_model_path)
+        if not has_inference_hooks:
+            # Keep a saved copy for external tools and debugging.
+            import shutil as _shutil
+            if os.path.isdir(defended_model_path):
+                _shutil.rmtree(defended_model_path)
+            print(f"[lm-harness] Saving defended model to {defended_model_path} …")
+            model_base.model.save_pretrained(defended_model_path)
+            model_base.tokenizer.save_pretrained(defended_model_path)
 
         try:
             lm_harness_result = run_lm_harness(
-                model_path=defended_model_path,
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                fwd_pre_hooks=defense_fwd_pre_hooks,
+                fwd_hooks=defense_fwd_hooks,
                 tasks=args.lm_harness_tasks.split(","),
                 n_samples=args.lm_harness_n,
                 output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
+                batch_size=4,
                 seed=args.seed,
             )
         except Exception as _e:
@@ -1258,6 +1505,10 @@ def run_pipeline(args):
         print(f"  --- HarmBench ASR (Mazeika et al.) ---")
         print(f"  ASR                : {harmbench_result['asr']:.4f} "
               f"({harmbench_result['n_harmful']}/{harmbench_result['n_total']})")
+    for attack_name, attack_result in harmbench_post_attack_results.items():
+        if attack_result:
+            print(f"  HarmBench after {attack_name:9s}: {attack_result['asr']:.4f} "
+                  f"({attack_result['n_harmful']}/{attack_result['n_total']})")
 
     if xstest_result:
         print(f"  --- XSTest over-refusal (Röttger et al.) ---")
@@ -1301,7 +1552,16 @@ def run_pipeline(args):
             "leace_score_undefended", "leace_score_defended",
             "kl_harmful", "kl_harmless",
             "harmbench_asr",
+            "harmbench_asr_pre_attack",
+            "harmbench_asr_post_gcg",
+            "harmbench_asr_post_autodan",
+            "harmbench_asr_post_cipherchat",
+            "harmbench_asr_post_pair",
+            "harmbench_asr_post_renellm",
             "xstest_over_refusal_rate",
+            "gsm8k_exact_match_undefended",
+            "math500_exact_match_undefended",
+            "mmlu_acc_undefended",
             "gsm8k_exact_match",
             "math500_exact_match",
             "mmlu_acc",
@@ -1341,6 +1601,12 @@ def run_pipeline(args):
             "leace_score_undefended": "",
             "leace_score_defended": "",
             "harmbench_asr": "",
+            "harmbench_asr_pre_attack": "",
+            "harmbench_asr_post_gcg": "",
+            "harmbench_asr_post_autodan": "",
+            "harmbench_asr_post_cipherchat": "",
+            "harmbench_asr_post_pair": "",
+            "harmbench_asr_post_renellm": "",
             "xstest_over_refusal_rate": "",
             "gsm8k_exact_match": "",
             "math500_exact_match": "",
@@ -1364,8 +1630,32 @@ def run_pipeline(args):
             row["leace_score_defended"] = f"{leace_result['post_attack_refusal_score']:.4f}"
         if harmbench_result:
             row["harmbench_asr"] = f"{harmbench_result['asr']:.4f}"
+            row["harmbench_asr_pre_attack"] = f"{harmbench_result['asr']:.4f}"
+        if harmbench_post_attack_results.get("gcg"):
+            row["harmbench_asr_post_gcg"] = f"{harmbench_post_attack_results['gcg']['asr']:.4f}"
+        if harmbench_post_attack_results.get("autodan"):
+            row["harmbench_asr_post_autodan"] = f"{harmbench_post_attack_results['autodan']['asr']:.4f}"
+        if harmbench_post_attack_results.get("cipherchat"):
+            row["harmbench_asr_post_cipherchat"] = f"{harmbench_post_attack_results['cipherchat']['asr']:.4f}"
+        if harmbench_post_attack_results.get("pair"):
+            row["harmbench_asr_post_pair"] = f"{harmbench_post_attack_results['pair']['asr']:.4f}"
+        if harmbench_post_attack_results.get("renellm"):
+            row["harmbench_asr_post_renellm"] = f"{harmbench_post_attack_results['renellm']['asr']:.4f}"
         if xstest_result:
             row["xstest_over_refusal_rate"] = f"{xstest_result['over_refusal_rate']:.4f}"
+        if lm_harness_undefended:
+            if "gsm8k" in lm_harness_undefended:
+                v = lm_harness_undefended["gsm8k"].get("exact_match")
+                if v is not None:
+                    row["gsm8k_exact_match_undefended"] = f"{v:.4f}"
+            if "math500" in lm_harness_undefended:
+                v = lm_harness_undefended["math500"].get("exact_match")
+                if v is not None:
+                    row["math500_exact_match_undefended"] = f"{v:.4f}"
+            if "mmlu" in lm_harness_undefended:
+                v = lm_harness_undefended["mmlu"].get("acc")
+                if v is not None:
+                    row["mmlu_acc_undefended"] = f"{v:.4f}"
         if lm_harness_result:
             if "gsm8k" in lm_harness_result:
                 v = lm_harness_result["gsm8k"].get("exact_match")

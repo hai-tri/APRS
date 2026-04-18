@@ -31,8 +31,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _REFUSAL_DIR = os.path.join(_ROOT, "refusal_direction")
 if _REFUSAL_DIR not in sys.path:
     sys.path.insert(0, _REFUSAL_DIR)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from pipeline.utils.hook_utils import add_hooks
+from device_utils import load_model_for_device as _dev_load_model
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +358,9 @@ def evaluate_pair(
         from transformers import AutoModelForCausalLM, AutoTokenizer
         print(f"[PAIR] Loading attacker model: {attacker_model_path}")
         attacker_tokenizer = AutoTokenizer.from_pretrained(attacker_model_path)
-        attacker_model = AutoModelForCausalLM.from_pretrained(
-            attacker_model_path, torch_dtype=torch.bfloat16, device_map="auto",
+        attacker_model = _dev_load_model(
+            AutoModelForCausalLM, attacker_model_path,
+            torch_dtype=torch.bfloat16, trust_remote_code=False,
         )
         attacker_model.eval()
     else:
@@ -397,7 +401,8 @@ def evaluate_pair(
     for r in per_behavior:
         s = get_refusal_scores(
             model, [r["best_prompt"]], tokenize_fn, refusal_toks,
-            fwd_pre_hooks=[], fwd_hooks=[],
+            fwd_pre_hooks=fwd_pre_hooks,
+            fwd_hooks=fwd_hooks,
         )
         scores.append(s.mean().item())
 
