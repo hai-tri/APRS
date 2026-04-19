@@ -84,9 +84,12 @@ if [[ -f "$LLAMA_MODEL" ]] && ! grep -q 'attn_implementation' "$LLAMA_MODEL"; th
     echo "   patched llama3_model.py"
 fi
 
-# 6. HF login (optional)
+# 6. HF login (optional) — write token to hub cache, works across hf/huggingface-cli versions
 if [[ -n "$HF_TOKEN" ]]; then
-    "$VENV/bin/huggingface-cli" login --token "$HF_TOKEN"
+    mkdir -p "$HOME/.cache/huggingface"
+    printf '%s' "$HF_TOKEN" > "$HOME/.cache/huggingface/token"
+    chmod 600 "$HOME/.cache/huggingface/token"
+    echo "   wrote HF token to ~/.cache/huggingface/token"
 fi
 
 echo ""
