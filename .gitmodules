@@ -1,6 +1,6 @@
 [submodule "refusal_direction"]
 	path = refusal_direction
-	url = https://github.com/andyrdt/refusal_direction.git
+	url = https://github.com/hai-tri/refusal_direction.git
 [submodule "heretic"]
 	path = heretic
 	url = https://github.com/p-e-w/heretic.git
