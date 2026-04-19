@@ -113,9 +113,11 @@ def main():
         W_new = rank_one_update(W, x, target)
         xm.mark_step()
         err = (W_new.float() @ x - target).norm().item()
+        rel = err / max(target.norm().item(), 1e-12)
         layer.weight.data = W_new  # leave patched for next step
-        print(f"rank-1 residual error = {err:.2e}")
-        assert err < 1e-2, f"rank-1 update failed — residual {err}"
+        print(f"rank-1 residual error = {err:.2e} (rel = {rel:.2e})")
+        # bf16 weights → ~1e-2 relative error is expected on XLA/TPU
+        assert rel < 5e-2, f"rank-1 update failed — rel residual {rel}"
     except Exception as e:
         fail("rank-1 update failed", e)
 
