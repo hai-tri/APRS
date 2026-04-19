@@ -1301,14 +1301,30 @@ def run_pipeline(args):
                     artifact_dir=obf_artifact_dir,
                 )
             if cipherchat_result and cipherchat_result.get("best_cipher"):
-                cipher_entries = cipherchat_result["per_cipher"][cipherchat_result["best_cipher"]]["completions"]
+                best_cipher = cipherchat_result["best_cipher"]
+                cipher_entries = cipherchat_result["per_cipher"][best_cipher]["completions"]
+                # Decode responses with the matching cipher so HarmBench (trained on
+                # natural-language prompt/response pairs) sees plain text instead of
+                # cipher glyphs it cannot classify. Falls back to the raw response
+                # when decoding fails.
+                from attacks.evaluate_cipherchat import CIPHER_SYSTEMS as _CIPHERS
+                decode_fn = _CIPHERS.get(best_cipher, {}).get("decode")
+                def _decode_safe(txt):
+                    if decode_fn is None:
+                        return txt
+                    try:
+                        out = decode_fn(txt)
+                        return out if out and out.strip() else txt
+                    except Exception:
+                        return txt
+                decoded_responses = [_decode_safe(c["response"]) for c in cipher_entries]
                 harmbench_post_attack_results["cipherchat"] = _generate_harmbench_for_attack(
                     label="cipherchat",
                     model=model_base.model,
                     tokenize_fn=model_base.tokenize_instructions_fn,
                     behaviors=[c["original_prompt"] for c in cipher_entries],
                     attacked_prompts=[c["encoded_prompt"] for c in cipher_entries],
-                    responses=[c["response"] for c in cipher_entries],
+                    responses=decoded_responses,
                     artifact_dir=obf_artifact_dir,
                 )
             if pair_result:

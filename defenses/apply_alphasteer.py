@@ -15,10 +15,12 @@ Algorithm (per layer ℓ):
      where A = H_harmful.
   5. Steering matrix M_ℓ = P_ℓ @ Δ_ℓ  (shape d × d)
 
-At inference (via forward pre-hook on each block):
-  last_h = hidden_states[:, last_token_idx, :]     # (B, d)
-  delta  = last_h @ M_ℓ * strength                 # (B, d)
-  hidden_states += delta.unsqueeze(1)               # broadcast to all tokens
+At inference (via forward pre-hook on each block, with_kwargs=True so the
+hook receives `attention_mask` and can pick the last *valid* token under
+either left or right padding, matching upstream):
+  last_h = hidden_states[batch_idx, last_valid_idx, :]  # (B, d)
+  delta  = last_h @ M_ℓ * strength                      # (B, d)
+  hidden_states += delta.unsqueeze(1)                    # broadcast to all tokens
 
 Reference: "AlphaSteer: Learning Refusal Steering with Principled Null-Space
 Constraint" — Hu et al., ICLR 2026
@@ -39,6 +41,31 @@ if _REFUSAL_DIR not in sys.path:
     sys.path.insert(0, _REFUSAL_DIR)
 
 from pipeline.submodules.generate_directions import get_mean_activations
+
+
+def _last_valid_token_index(attention_mask, seq_len, batch_size, device):
+    """Index of the last non-pad token per sample (robust to left/right padding).
+
+    Mirrors `utils/mask_utils.py` in the upstream AlphaSteer repo
+    (https://github.com/AlphaLab-USTC/AlphaSteer): handles both 2D padding
+    masks (1=valid, 0=pad) and 4D additive causal masks (0.0=valid, -inf=pad).
+    """
+    if attention_mask is None:
+        return torch.full((batch_size,), seq_len - 1, dtype=torch.long, device=device)
+
+    if attention_mask.dim() == 4:
+        last_row = attention_mask[:, 0, -1, :]
+        valid_mask = last_row == 0
+    elif attention_mask.dim() == 2:
+        valid_mask = attention_mask != 0
+    else:
+        return torch.full((batch_size,), seq_len - 1, dtype=torch.long, device=device)
+
+    has_valid = valid_mask.any(dim=-1)
+    flipped = torch.flip(valid_mask.to(dtype=torch.long), dims=[1])
+    inv_idx = flipped.argmax(dim=-1)
+    last_idx = (seq_len - 1) - inv_idx
+    return torch.where(has_valid, last_idx, torch.zeros_like(last_idx))
 
 
 # ---------------------------------------------------------------------------
@@ -75,15 +102,11 @@ def _collect_activations(
         def _make_hook(idx):
             def hook(module, input, output):
                 h = output[0] if isinstance(output, tuple) else output
-                # Grab the requested position
                 if position == -1:
-                    # last non-padding token per sample
                     attn_mask = inputs.get("attention_mask")
-                    if attn_mask is not None:
-                        last_idx = attn_mask.sum(dim=1).long() - 1  # (B,)
-                        h_pos = h[torch.arange(h.size(0), device=h.device), last_idx]
-                    else:
-                        h_pos = h[:, -1, :]
+                    B, T = h.size(0), h.size(1)
+                    last_idx = _last_valid_token_index(attn_mask, T, B, h.device)
+                    h_pos = h[torch.arange(B, device=h.device), last_idx]
                 else:
                     h_pos = h[:, position, :]
                 layer_acts[idx] = h_pos.detach().float().cpu()
@@ -217,44 +240,37 @@ def _make_alphasteer_hook(
     steering_matrix: torch.Tensor,
     strength: float,
 ):
-    """
-    Return a forward pre-hook that applies AlphaSteer steering.
+    """Forward pre-hook applying AlphaSteer steering at the last non-pad token.
 
-    At each layer, for the last valid token position:
-        steering_vector = last_hidden @ M * strength
-        hidden_states  += steering_vector  (broadcast to all sequence positions)
+    Registered with ``with_kwargs=True`` so the block's ``attention_mask``
+    kwarg is available, matching upstream's `AlphaLlamaDecoderLayer.forward`
+    which indexes hidden states by the true last-valid-token position (robust
+    to both left and right padding).
 
-    Only activates during prefill (seq_len > 1) to avoid repeated steering
-    during token-by-token decoding.
+    Steers only during prefill (seq_len > 1).
     """
     M = steering_matrix.float()
 
-    def hook(module, input):
-        if isinstance(input, tuple):
-            x = input[0]
-        else:
-            x = input
-
-        # Only steer during prefill
+    def hook(module, args, kwargs):
+        x = args[0] if isinstance(args, tuple) else args
         if x.shape[1] <= 1:
-            return input if isinstance(input, tuple) else x
+            return None
 
         dtype = x.dtype
-        x_f = x.float()  # (B, T, d)
-        B, T, d = x_f.shape
+        B, T, _ = x.shape
+        attention_mask = kwargs.get("attention_mask", None)
+        last_idx = _last_valid_token_index(attention_mask, T, B, x.device)
 
-        # Use last token of each sequence
-        last_h = x_f[:, -1, :]          # (B, d)
-        M_dev  = M.to(x_f.device)
+        batch_idx = torch.arange(B, device=x.device)
+        last_h = x[batch_idx, last_idx, :].float()     # (B, d)
+        M_dev = M.to(x.device)
+        sv = (last_h @ M_dev) * strength               # (B, d)
+        x_new = (x.float() + sv.unsqueeze(1)).to(dtype)
 
-        sv = (last_h @ M_dev) * strength  # (B, d)
-        x_f = x_f + sv.unsqueeze(1)       # broadcast to (B, T, d)
+        new_args = (x_new,) + tuple(args[1:]) if isinstance(args, tuple) else (x_new,)
+        return new_args, kwargs
 
-        out = x_f.to(dtype)
-        if isinstance(input, tuple):
-            return (out,) + input[1:]
-        return out
-
+    hook._with_kwargs = True
     return hook
 
 
