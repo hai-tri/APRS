@@ -61,9 +61,11 @@ PYEOF
 if [[ -f "$REPO_DIR/requirements.txt" ]]; then
     echo ""
     echo "── Installing APRS requirements (filtered for TPU) …"
-    grep -vE '^(flash[_-]attn|vllm|bitsandbytes)' "$REPO_DIR/requirements.txt" \
+    grep -vE '^(flash[_-]attn|vllm|bitsandbytes|transformers)' "$REPO_DIR/requirements.txt" \
         > /tmp/req_tpu.txt
     "$PIP" install -q -r /tmp/req_tpu.txt
+    # Pin transformers below the versions that hard-require flash_attn in PACKAGE_DISTRIBUTION_MAPPING
+    "$PIP" install -q "transformers==4.46.3"
 fi
 
 # 4. flash_attn stub so HF doesn't try to import it
