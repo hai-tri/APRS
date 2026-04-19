@@ -33,6 +33,9 @@ echo "================================================================"
 # 1. Conda env with Python 3.10
 if [[ ! -x "$VENV/bin/python3" ]]; then
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    # Non-interactive ToS acceptance for default channels (newer conda requires this)
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r    2>/dev/null || true
     conda create -y -p "$VENV" python=3.10
 fi
 PY="$VENV/bin/python3"
