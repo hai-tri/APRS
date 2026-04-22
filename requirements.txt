@@ -1,0 +1,48 @@
+# APRS requirements
+# Install in two steps to prevent vllm from overwriting the CUDA torch build:
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124  # re-pin after vllm
+
+# Core ML
+transformers>=4.46.3
+accelerate>=1.13.0
+datasets
+peft
+safetensors
+sentencepiece
+protobuf
+tokenizers
+
+# Numerics
+numpy>=2.2.0
+scipy
+scikit-learn
+einops
+jaxtyping
+
+# Evaluation
+lm_eval
+vllm
+optuna
+
+# Utilities
+matplotlib
+tqdm
+pandas
+rouge_score
+nltk
+tabulate
+portalocker
+
+# Attacks / pipeline deps
+openai
+anthropic
+requests
+
+# TPU (optional): install only on TPU VMs. Must match torch version above.
+#   pip install torch_xla[tpu]~=2.5.0 \
+#     -f https://storage.googleapis.com/libtpu-releases/index.html
+# The code auto-detects XLA via device_utils.py; CUDA/MPS/CPU paths are
+# unchanged. Known TPU limitations: heretic/ (use --skip_heretic) and
+# in-process lm-eval-harness (the subprocess path receives --device xla).
